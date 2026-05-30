@@ -69,7 +69,7 @@ export default function App() {
     setBootStatus('checking')
     setBootError('')
     try {
-      await initStore()
+      await initStore(user)
       applyStartupImports()
       setBootStatus('ready')
     } catch (error) {

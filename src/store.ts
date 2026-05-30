@@ -40,7 +40,7 @@ import {
   clearImages,
   storeImage,
 } from './lib/db'
-import { fetchRemoteImageAsDataUrl, loadBackendSettings, redactSettingsForLocalStorage, saveBackendSettings } from './lib/backendApi'
+import { fetchRemoteImageAsDataUrl, loadBackendSettings, redactSettingsForLocalStorage, saveBackendSettings, type AuthUser } from './lib/backendApi'
 import { callImageApi } from './lib/api'
 import { callAgentConversationTitleApi, callAgentResponsesApi, callBatchImageSingle, parseBatchImageCallArguments, type AgentApiResultImage, type BatchImageCallResult } from './lib/agentApi'
 import { collectAgentRoundOutputImageSlots, extractAgentReferenceIds, getAgentCurrentReferenceId, getAgentGeneratedImageReferenceId, replaceAgentPromptImageReferencesForApi } from './lib/agentImageReferences'
@@ -78,6 +78,8 @@ let agentConversationMigrationPending = false
 let backendSettingsPersistenceReady = false
 let backendSettingsHydrating = false
 let backendSettingsSaveTimer: ReturnType<typeof setTimeout> | null = null
+let activeLocalStateUserId: number | null = null
+const LOCAL_STATE_STORAGE_KEY = 'gpt-image-playground'
 const OPENAI_INTERRUPTED_ERROR = '请求中断'
 const AGENT_STOPPED_MESSAGE = '已停止生成。'
 const AGENT_CONVERSATION_TITLE_MAX_LENGTH = 28
@@ -605,11 +607,32 @@ function getLatestAgentConversation(conversations: AgentConversation[]) {
   }, null)
 }
 
+function getLocalStateStorageName(userId: number) {
+  return `${LOCAL_STATE_STORAGE_KEY}:user:${userId}`
+}
+
+function readStoredLocalStateForUser(userId: number): unknown {
+  if (typeof localStorage === 'undefined') return undefined
+
+  try {
+    const raw = localStorage.getItem(getLocalStateStorageName(userId))
+    if (!raw) return undefined
+    const parsed = JSON.parse(raw) as unknown
+    if (!isRecord(parsed)) return undefined
+
+    const persistedState = 'state' in parsed ? parsed.state : parsed
+    return parsed.version === 2 ? persistedState : migratePersistedState(persistedState)
+  } catch {
+    return undefined
+  }
+}
+
 export function getPersistedState(state: AppState) {
   const settings = normalizeSettings(state.settings)
   const persistedSettings = redactSettingsForLocalStorage(settings)
   const galleryInputDraft = getPersistableGalleryInputDraft(state)
   return {
+    localStateUserId: activeLocalStateUserId,
     settings: persistedSettings,
     params: state.params,
     ...(settings.persistInputOnRestart && (state.appMode === 'gallery' || galleryInputDraft)
@@ -648,7 +671,10 @@ function getPersistableAgentConversation(conversation: AgentConversation): Agent
 function mergePersistedState(persistedState: unknown, currentState: AppState): AppState {
   if (!persistedState || typeof persistedState !== 'object') return currentState
 
-  const persisted = persistedState as Partial<AppState>
+  const persisted = persistedState as Partial<AppState> & { localStateUserId?: unknown }
+  if (activeLocalStateUserId == null) return currentState
+  if (persisted.localStateUserId != null && persisted.localStateUserId !== activeLocalStateUserId) return currentState
+
   const settings = normalizeSettings(persisted.settings ?? currentState.settings)
   const hasPersistedAgentConversations = Array.isArray(persisted.agentConversations)
   if (hasPersistedAgentConversations && normalizeAgentConversations(persisted.agentConversations).length > 0) {
@@ -1481,7 +1507,7 @@ export const useStore = create<AppState>()(
       },
     }),
     {
-      name: 'gpt-image-playground',
+      name: LOCAL_STATE_STORAGE_KEY,
       version: 2,
       migrate: (persistedState) => migratePersistedState(persistedState),
       partialize: getPersistedState,
@@ -1521,6 +1547,96 @@ useStore.subscribe((state) => {
   }
   void flushAgentConversationsToIndexedDB()
 })
+
+function clearRuntimeStateForUserSwitch() {
+  imageCache.clear()
+  thumbnailCache.clear()
+  thumbnailBackfillIds.clear()
+  thumbnailBackfillRunningIds.clear()
+  thumbnailSubscribers.clear()
+  for (const timer of falRecoveryTimers.values()) clearTimeout(timer)
+  falRecoveryTimers.clear()
+  for (const timer of customRecoveryTimers.values()) clearTimeout(timer)
+  customRecoveryTimers.clear()
+  for (const timer of openAIWatchdogTimers.values()) clearTimeout(timer)
+  openAIWatchdogTimers.clear()
+  for (const controller of agentRoundControllers.values()) controller.abort()
+  agentRoundControllers.clear()
+  if (backendSettingsSaveTimer) clearTimeout(backendSettingsSaveTimer)
+  backendSettingsSaveTimer = null
+  backendSettingsPersistenceReady = false
+  backendSettingsHydrating = false
+  agentConversationPersistenceReady = false
+  agentConversationMigrationPending = false
+  agentConversationPersistRunning = false
+  agentConversationPersistQueued = false
+}
+
+function getUserSessionResetState(): Partial<AppState> {
+  return {
+    appMode: 'gallery',
+    settings: { ...DEFAULT_SETTINGS },
+    params: { ...DEFAULT_PARAMS },
+    dismissedCodexCliPrompts: [],
+    prompt: '',
+    inputImages: [],
+    maskDraft: null,
+    maskEditorImageId: null,
+    galleryInputDraft: null,
+    reusedTaskApiProfileId: null,
+    reusedTaskApiProfileName: null,
+    reusedTaskApiProfileMissing: false,
+    agentConversations: [],
+    agentConversationsLoaded: false,
+    activeAgentConversationId: null,
+    agentInputDrafts: {},
+    agentSidebarCollapsed: false,
+    agentAssetTab: 'outputs',
+    agentAssetPanelCollapsed: false,
+    agentMobileHeaderVisible: true,
+    agentEditingRoundId: null,
+    agentEditingConversationId: null,
+    agentGeneratingTitleIds: {},
+    tasks: [],
+    streamPreviews: {},
+    streamPreviewSlots: {},
+    searchQuery: '',
+    filterStatus: 'all',
+    filterFavorite: false,
+    selectedTaskIds: [],
+    detailTaskId: null,
+    lightboxImageId: null,
+    lightboxImageList: [],
+    showSettings: false,
+    settingsTabRequest: null,
+    supportPromptOpen: false,
+    supportPromptDismissed: false,
+    supportPromptSkippedForImportedData: false,
+    toast: null,
+    confirmDialog: null,
+  }
+}
+
+function prepareStoreForUser(user: AuthUser) {
+  if (activeLocalStateUserId === user.id) return
+
+  const persistedLocalState = readStoredLocalStateForUser(user.id)
+  activeLocalStateUserId = user.id
+  useStore.persist.setOptions({ name: getLocalStateStorageName(user.id) })
+
+  clearRuntimeStateForUserSwitch()
+  useStore.setState(getUserSessionResetState())
+  if (persistedLocalState) {
+    useStore.setState((state) => mergePersistedState(persistedLocalState, state))
+  }
+
+  lastStoredAgentConversations = useStore.getState().agentConversations
+  try {
+    localStorage.removeItem(LOCAL_STATE_STORAGE_KEY)
+  } catch {
+    // Best-effort cleanup of the pre-auth local persistence key.
+  }
+}
 
 // ===== Actions =====
 
@@ -1905,7 +2021,8 @@ async function recoverFalTask(taskId: string) {
 }
 
 /** 初始化：从后端加载配置与任务，按需恢复输入图片，并清理孤立图片 */
-export async function initStore() {
+export async function initStore(user?: AuthUser) {
+  if (user) prepareStoreForUser(user)
   const backendSettings = await loadBackendSettings()
   if (backendSettings.settings) {
     backendSettingsHydrating = true
