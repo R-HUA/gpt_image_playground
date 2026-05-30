@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { useStore } from '../store'
 import { useVersionCheck } from '../hooks/useVersionCheck'
 import { useTooltip } from '../hooks/useTooltip'
+import { getStoredAuthUser, logout } from '../lib/backendApi'
 import { dismissAllTooltips } from '../lib/tooltipDismiss'
 import ViewportTooltip from './ViewportTooltip'
 import HelpModal from './HelpModal'
@@ -39,6 +40,7 @@ export default function Header() {
   const [showHistoryModal, setShowHistoryModal] = useState(false)
   const historyButtonRef = useRef<HTMLButtonElement>(null)
   const createConversation = useStore((s) => s.createAgentConversation)
+  const currentUser = getStoredAuthUser()
 
   useEffect(() => {
     if (appMode === 'agent') {
@@ -142,6 +144,12 @@ export default function Header() {
     }
   }
 
+  const handleLogout = async () => {
+    dismissAllTooltips()
+    await logout()
+    window.location.reload()
+  }
+
   return (
     <>
       <header data-no-drag-select className={`safe-area-top fixed top-0 left-0 right-0 z-40 bg-white/80 dark:bg-gray-950/80 backdrop-blur border-b border-gray-200 dark:border-white/[0.08] transition-transform duration-300 ease-in-out ${appMode === 'agent' && !agentMobileHeaderVisible ? '-translate-y-full sm:translate-y-0' : 'translate-y-0'}`}>
@@ -229,6 +237,14 @@ export default function Header() {
             </button>
           </div>
           <div className="flex items-center gap-1 shrink-0">
+            <button
+              type="button"
+              onClick={() => void handleLogout()}
+              className="inline-flex max-w-[84px] sm:max-w-[160px] items-center truncate rounded-lg px-2 sm:px-3 py-2 text-sm text-gray-600 hover:text-gray-900 dark:text-gray-400 dark:hover:text-gray-100 hover:bg-gray-100 dark:hover:bg-gray-900 transition-colors"
+              title={currentUser ? `退出登录：${currentUser.username}` : '退出登录'}
+            >
+              {currentUser?.username ? `${currentUser.username} · 退出` : '退出'}
+            </button>
             {!isPwaInstalled && (
               <div
                 className="relative"

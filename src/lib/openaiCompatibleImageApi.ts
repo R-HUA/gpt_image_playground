@@ -1,12 +1,11 @@
 import { DEFAULT_STREAM_PARTIAL_IMAGES, type ApiProfile, type CustomProviderDefinition, type CustomProviderPollMapping, type CustomProviderResultMapping, type CustomProviderSubmitMapping, type ImageApiResponse, type ImageResponseItem, type ResponsesApiResponse, type ResponsesOutputItem, type TaskParams } from '../types'
 import { dataUrlToBlob, imageDataUrlToPngBlob, maskDataUrlToPngBlob } from './canvasImage'
-import { buildApiUrl, readClientDevProxyConfig, shouldUseApiProxy } from './devProxy'
+import { fetchRemoteImageAsDataUrl, providerJsonFetch, providerMultipartFetch } from './backendApi'
 import {
   assertImageInputPayloadSize,
   assertMaskEditFileSize,
   type CallApiOptions,
   type CallApiResult,
-  fetchImageUrlAsDataUrl,
   getApiErrorMessage,
   getDataUrlDecodedByteSize,
   getDataUrlEncodedByteSize,
@@ -78,12 +77,6 @@ function normalizeImageApiPayload(value: unknown): ImageApiResponse {
   if (Array.isArray(value)) return { data: value as ImageApiResponse['data'] }
   if (value && typeof value === 'object') return value as ImageApiResponse
   return { data: [] }
-}
-
-function createRequestHeaders(profile: ApiProfile): Record<string, string> {
-  return {
-    Authorization: `Bearer ${profile.apiKey}`,
-  }
 }
 
 function isEventStreamResponse(response: Response): boolean {
@@ -303,8 +296,14 @@ async function parseImagesApiResponse(payload: ImageApiResponse, mime: string, s
         continue
       }
 
-      if (isHttpUrl(item.url) || isDataUrl(item.url)) {
-        images.push(await fetchImageUrlAsDataUrl(item.url, mime, signal))
+      if (isDataUrl(item.url)) {
+        images.push(item.url)
+        revisedPrompts.push(typeof item.revised_prompt === 'string' ? item.revised_prompt : undefined)
+        continue
+      }
+
+      if (isHttpUrl(item.url)) {
+        images.push(await fetchRemoteImageAsDataUrl(item.url, mime, signal))
         revisedPrompts.push(typeof item.revised_prompt === 'string' ? item.revised_prompt : undefined)
       }
     }
@@ -538,9 +537,6 @@ async function callImagesApiSingle(opts: CallApiOptions, profile: ApiProfile, cu
     : originalPrompt
   const isEdit = inputImageDataUrls.length > 0
   const mime = MIME_MAP[params.output_format] || 'image/png'
-  const proxyConfig = readClientDevProxyConfig()
-  const useApiProxy = shouldUseApiProxy(profile.apiProxy, proxyConfig)
-  const requestHeaders = createRequestHeaders(profile)
   const paths = createOpenAICompatiblePaths(customProvider)
 
   const controller = new AbortController()
@@ -603,13 +599,7 @@ async function callImagesApiSingle(opts: CallApiOptions, profile: ApiProfile, cu
         formData.append('mask', maskBlob, 'mask.png')
       }
 
-      response = await fetch(buildApiUrl(profile.baseUrl, paths.editPath, proxyConfig, useApiProxy), {
-        method: 'POST',
-        headers: requestHeaders,
-        cache: 'no-store',
-        body: formData,
-        signal: controller.signal,
-      })
+      response = await providerMultipartFetch(profile, paths.editPath, formData, controller.signal)
     } else {
       const body: Record<string, unknown> = {
         model: profile.model,
@@ -637,16 +627,7 @@ async function callImagesApiSingle(opts: CallApiOptions, profile: ApiProfile, cu
         body.partial_images = getStreamPartialImages(profile)
       }
 
-      response = await fetch(buildApiUrl(profile.baseUrl, paths.generationPath, proxyConfig, useApiProxy), {
-        method: 'POST',
-        headers: {
-          ...requestHeaders,
-          'Content-Type': 'application/json',
-        },
-        cache: 'no-store',
-        body: JSON.stringify(body),
-        signal: controller.signal,
-      })
+      response = await providerJsonFetch(profile, paths.generationPath, body, 'POST', controller.signal)
     }
 
     if (!response.ok) {
@@ -800,7 +781,7 @@ async function extractCustomImages(payload: unknown, result: CustomProviderResul
       }
     }
     for (const url of imageUrls) {
-      images.push(await fetchImageUrlAsDataUrl(url, mime, signal))
+      images.push(isDataUrl(url) ? url : await fetchRemoteImageAsDataUrl(url, mime, signal))
     }
   } catch (err) {
     if (rawImageUrls.length > 0 && err instanceof Error) {
@@ -817,43 +798,33 @@ async function extractCustomImages(payload: unknown, result: CustomProviderResul
   return { images, ...(rawImageUrls.length ? { rawImageUrls } : {}) }
 }
 
-async function submitCustomRequest(mapping: CustomProviderSubmitMapping, opts: CallApiOptions, profile: ApiProfile, controller: AbortController, proxyConfig: ReturnType<typeof readClientDevProxyConfig>, useApiProxy: boolean): Promise<unknown> {
-  const requestHeaders = createRequestHeaders(profile)
+async function submitCustomRequest(mapping: CustomProviderSubmitMapping, opts: CallApiOptions, profile: ApiProfile, controller: AbortController): Promise<unknown> {
   const context = createCustomProviderContext(opts, profile)
   const method = mapping.method ?? 'POST'
   const contentType = mapping.contentType ?? 'json'
   const path = appendQuery(mapping.path, renderQuery(mapping.query, context))
-  const headers: Record<string, string> = { ...requestHeaders }
-  let body: BodyInit | undefined
+  let response: Response
 
-  if (method !== 'GET') {
-    if (contentType === 'multipart') {
-      const formData = await createCustomMultipartBody(mapping, opts, context)
-      if (profile.responseFormatB64Json) {
-        formData.append('response_format', 'b64_json')
-      }
-      body = formData
-    } else {
+  if (method !== 'GET' && contentType === 'multipart') {
+    const formData = await createCustomMultipartBody(mapping, opts, context)
+    if (profile.responseFormatB64Json) {
+      formData.append('response_format', 'b64_json')
+    }
+    response = await providerMultipartFetch(profile, path, formData, controller.signal, method)
+  } else {
+    let resolved: unknown
+    if (method !== 'GET') {
       assertImageInputPayloadSize(
         opts.inputImageDataUrls.reduce((sum, dataUrl) => sum + getDataUrlEncodedByteSize(dataUrl), 0) +
           (opts.maskDataUrl ? getDataUrlEncodedByteSize(opts.maskDataUrl) : 0),
       )
-      headers['Content-Type'] = 'application/json'
-      const resolved = resolveTemplateValue(mapping.body ?? {}, context)
+      resolved = resolveTemplateValue(mapping.body ?? {}, context)
       if (profile.responseFormatB64Json && resolved && typeof resolved === 'object' && !Array.isArray(resolved)) {
         (resolved as Record<string, unknown>).response_format = 'b64_json'
       }
-      body = JSON.stringify(resolved)
     }
+    response = await providerJsonFetch(profile, path, resolved, method, controller.signal)
   }
-
-  const response = await fetch(buildApiUrl(profile.baseUrl, path, proxyConfig, useApiProxy), {
-    method,
-    headers,
-    cache: 'no-store',
-    body,
-    signal: controller.signal,
-  })
 
   if (!response.ok) throw new Error(await getApiErrorMessage(response))
   return response.json()
@@ -866,8 +837,6 @@ async function pollCustomTaskResult(
   mime: string,
   signal?: AbortSignal,
 ): Promise<CallApiResult> {
-  const proxyConfig = readClientDevProxyConfig()
-  const requestHeaders = createRequestHeaders(profile)
   let isFirstPoll = true
 
   while (true) {
@@ -882,12 +851,7 @@ async function pollCustomTaskResult(
     const taskPath = appendQuery(buildTaskPath(poll.path, taskId), poll.query)
     let taskPayload: unknown
     try {
-      const taskResponse = await fetch(buildApiUrl(profile.baseUrl, taskPath, proxyConfig, false), {
-        method: poll.method ?? 'GET',
-        headers: requestHeaders,
-        cache: 'no-store',
-        signal,
-      })
+      const taskResponse = await providerJsonFetch(profile, taskPath, undefined, poll.method ?? 'GET', signal)
 
       if (!taskResponse.ok) {
         if (isRetryablePollingStatus(taskResponse.status)) continue
@@ -935,16 +899,8 @@ async function callCustomHttpImageApi(opts: CallApiOptions, profile: ApiProfile,
   let timeoutId: ReturnType<typeof setTimeout> | null = setTimeout(() => controller.abort(), profile.timeout * 1000)
 
   try {
-    const proxyConfig = readClientDevProxyConfig()
-    const useApiProxy = shouldUseApiProxy(profile.apiProxy, proxyConfig)
     const submitMapping = isEdit && customProvider.editSubmit ? customProvider.editSubmit : customProvider.submit
-    if (useApiProxy && (submitMapping.method ?? 'POST') !== 'POST') {
-      throw new Error('API 代理暂不支持使用 GET 提交的自定义服务商。请关闭 API 代理，或改用 POST 提交的自定义服务商配置。')
-    }
-    if (useApiProxy && (submitMapping.taskIdPath || customProvider.poll)) {
-      throw new Error('API 代理暂不支持使用异步任务的自定义服务商。请关闭 API 代理，或改用同步返回图片的自定义服务商配置。')
-    }
-    const submitPayload = await submitCustomRequest(submitMapping, opts, profile, controller, proxyConfig, useApiProxy)
+    const submitPayload = await submitCustomRequest(submitMapping, opts, profile, controller)
     const taskIdValue = submitMapping.taskIdPath ? getByPath(submitPayload, submitMapping.taskIdPath) : undefined
     const taskId = typeof taskIdValue === 'string' ? taskIdValue.trim() : String(taskIdValue ?? '').trim()
     if (submitMapping.taskIdPath && !taskId) {
@@ -1008,9 +964,6 @@ async function callResponsesImageApi(opts: CallApiOptions, profile: ApiProfile):
 async function callResponsesImageApiSingle(opts: CallApiOptions, profile: ApiProfile): Promise<CallApiResult> {
   const { prompt, params, inputImageDataUrls } = opts
   const mime = MIME_MAP[params.output_format] || 'image/png'
-  const proxyConfig = readClientDevProxyConfig()
-  const useApiProxy = shouldUseApiProxy(profile.apiProxy, proxyConfig)
-  const requestHeaders = createRequestHeaders(profile)
   const controller = new AbortController()
   const timeoutId = setTimeout(() => controller.abort(), profile.timeout * 1000)
 
@@ -1034,16 +987,7 @@ async function callResponsesImageApiSingle(opts: CallApiOptions, profile: ApiPro
       body.stream = true
     }
 
-    const response = await fetch(buildApiUrl(profile.baseUrl, 'responses', proxyConfig, useApiProxy), {
-      method: 'POST',
-      headers: {
-        ...requestHeaders,
-        'Content-Type': 'application/json',
-      },
-      cache: 'no-store',
-      body: JSON.stringify(body),
-      signal: controller.signal,
-    })
+    const response = await providerJsonFetch(profile, 'responses', body, 'POST', controller.signal)
 
     if (!response.ok) {
       throw new Error(await getApiErrorMessage(response))

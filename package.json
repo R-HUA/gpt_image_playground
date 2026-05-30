@@ -5,8 +5,11 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "dev:server": "npm run server:build -- --watch",
     "mock:api": "node scripts/mock-image-api.mjs",
-    "build": "tsc -b && vite build",
+    "build": "tsc -b && vite build && npm run server:build",
+    "server:build": "tsc -p tsconfig.server.json",
+    "start": "node server/dist/index.js",
     "deploy:cf": "npm run build && wrangler deploy",
     "preview": "vite preview",
     "test": "vitest run",

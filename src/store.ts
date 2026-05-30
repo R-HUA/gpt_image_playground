@@ -40,6 +40,7 @@ import {
   clearImages,
   storeImage,
 } from './lib/db'
+import { fetchRemoteImageAsDataUrl, loadBackendSettings, redactSettingsForLocalStorage, saveBackendSettings } from './lib/backendApi'
 import { callImageApi } from './lib/api'
 import { callAgentConversationTitleApi, callAgentResponsesApi, callBatchImageSingle, parseBatchImageCallArguments, type AgentApiResultImage, type BatchImageCallResult } from './lib/agentApi'
 import { collectAgentRoundOutputImageSlots, extractAgentReferenceIds, getAgentCurrentReferenceId, getAgentGeneratedImageReferenceId, replaceAgentPromptImageReferencesForApi } from './lib/agentImageReferences'
@@ -74,6 +75,9 @@ const openAIWatchdogTimers = new Map<string, ReturnType<typeof setTimeout>>()
 const agentRoundControllers = new Map<string, AbortController>()
 let agentConversationPersistenceReady = false
 let agentConversationMigrationPending = false
+let backendSettingsPersistenceReady = false
+let backendSettingsHydrating = false
+let backendSettingsSaveTimer: ReturnType<typeof setTimeout> | null = null
 const OPENAI_INTERRUPTED_ERROR = '请求中断'
 const AGENT_STOPPED_MESSAGE = '已停止生成。'
 const AGENT_CONVERSATION_TITLE_MAX_LENGTH = 28
@@ -128,6 +132,18 @@ function getTimeoutStreamingHint(profile?: TimeoutStreamingHintProfile | null) {
 
 function createOpenAITimeoutError(timeoutSeconds: number, profile?: TimeoutStreamingHintProfile | null) {
   return `请求超时：超过 ${timeoutSeconds} 秒仍未完成，请稍后重试或提高超时时间。${getTimeoutStreamingHint(profile)}`
+}
+
+function scheduleBackendSettingsSave(settings: AppSettings) {
+  if (!backendSettingsPersistenceReady || backendSettingsHydrating) return
+  if (backendSettingsSaveTimer) clearTimeout(backendSettingsSaveTimer)
+  const nextSettings = normalizeSettings(settings)
+  backendSettingsSaveTimer = setTimeout(() => {
+    backendSettingsSaveTimer = null
+    void saveBackendSettings(nextSettings).catch((error) => {
+      console.warn('Failed to save settings to backend:', error)
+    })
+  }, 250)
 }
 
 export function getCachedImage(id: string): string | undefined {
@@ -591,9 +607,10 @@ function getLatestAgentConversation(conversations: AgentConversation[]) {
 
 export function getPersistedState(state: AppState) {
   const settings = normalizeSettings(state.settings)
+  const persistedSettings = redactSettingsForLocalStorage(settings)
   const galleryInputDraft = getPersistableGalleryInputDraft(state)
   return {
-    settings,
+    settings: persistedSettings,
     params: state.params,
     ...(settings.persistInputOnRestart && (state.appMode === 'gallery' || galleryInputDraft)
       ? {
@@ -1107,47 +1124,52 @@ export const useStore = create<AppState>()(
 
       // Settings
       settings: { ...DEFAULT_SETTINGS },
-      setSettings: (s) => set((st) => {
-        const previous = normalizeSettings(st.settings)
-        const incoming = s as Partial<AppSettings>
-        const hasLegacyOverrides =
-          incoming.baseUrl !== undefined ||
-          incoming.apiKey !== undefined ||
-          incoming.model !== undefined ||
-          incoming.timeout !== undefined ||
-          incoming.apiMode !== undefined ||
-          incoming.codexCli !== undefined ||
-          incoming.apiProxy !== undefined ||
-          incoming.streamImages !== undefined ||
-          incoming.streamPartialImages !== undefined
-        const merged = normalizeSettings({ ...previous, ...incoming })
-        if (hasLegacyOverrides && incoming.profiles === undefined) {
-          merged.profiles = merged.profiles.map((profile) =>
-            profile.id === merged.activeProfileId
-              ? {
-                  ...profile,
-                  baseUrl: incoming.baseUrl ?? profile.baseUrl,
-                  apiKey: incoming.apiKey ?? profile.apiKey,
-                  model: incoming.model ?? profile.model,
-                  timeout: incoming.timeout ?? profile.timeout,
-                  apiMode: incoming.apiMode === 'images' || incoming.apiMode === 'responses' ? incoming.apiMode : profile.apiMode,
-                  codexCli: incoming.codexCli ?? profile.codexCli,
-                  apiProxy: incoming.apiProxy ?? profile.apiProxy,
-                  streamImages: incoming.streamImages ?? profile.streamImages,
-                  streamPartialImages: incoming.streamPartialImages ?? profile.streamPartialImages,
-                }
-              : profile,
-          )
-        }
-        const settings = normalizeSettings(merged)
-        const shouldClearReusedProfile = st.reusedTaskApiProfileId && settings.activeProfileId === st.reusedTaskApiProfileId
-        return {
-          settings,
-          ...(shouldClearReusedProfile
-            ? { reusedTaskApiProfileId: null, reusedTaskApiProfileName: null, reusedTaskApiProfileMissing: false }
-            : {}),
-        }
-      }),
+      setSettings: (s) => {
+        let nextSettings: AppSettings | null = null
+        set((st) => {
+          const previous = normalizeSettings(st.settings)
+          const incoming = s as Partial<AppSettings>
+          const hasLegacyOverrides =
+            incoming.baseUrl !== undefined ||
+            incoming.apiKey !== undefined ||
+            incoming.model !== undefined ||
+            incoming.timeout !== undefined ||
+            incoming.apiMode !== undefined ||
+            incoming.codexCli !== undefined ||
+            incoming.apiProxy !== undefined ||
+            incoming.streamImages !== undefined ||
+            incoming.streamPartialImages !== undefined
+          const merged = normalizeSettings({ ...previous, ...incoming })
+          if (hasLegacyOverrides && incoming.profiles === undefined) {
+            merged.profiles = merged.profiles.map((profile) =>
+              profile.id === merged.activeProfileId
+                ? {
+                    ...profile,
+                    baseUrl: incoming.baseUrl ?? profile.baseUrl,
+                    apiKey: incoming.apiKey ?? profile.apiKey,
+                    model: incoming.model ?? profile.model,
+                    timeout: incoming.timeout ?? profile.timeout,
+                    apiMode: incoming.apiMode === 'images' || incoming.apiMode === 'responses' ? incoming.apiMode : profile.apiMode,
+                    codexCli: incoming.codexCli ?? profile.codexCli,
+                    apiProxy: incoming.apiProxy ?? profile.apiProxy,
+                    streamImages: incoming.streamImages ?? profile.streamImages,
+                    streamPartialImages: incoming.streamPartialImages ?? profile.streamPartialImages,
+                  }
+                : profile,
+            )
+          }
+          const settings = normalizeSettings(merged)
+          nextSettings = settings
+          const shouldClearReusedProfile = st.reusedTaskApiProfileId && settings.activeProfileId === st.reusedTaskApiProfileId
+          return {
+            settings,
+            ...(shouldClearReusedProfile
+              ? { reusedTaskApiProfileId: null, reusedTaskApiProfileName: null, reusedTaskApiProfileMissing: false }
+              : {}),
+          }
+        })
+        if (nextSettings) scheduleBackendSettingsSave(nextSettings)
+      },
       dismissedCodexCliPrompts: [],
       dismissCodexCliPrompt: (key) => set((st) => ({
         dismissedCodexCliPrompts: st.dismissedCodexCliPrompts.includes(key)
@@ -1882,8 +1904,21 @@ async function recoverFalTask(taskId: string) {
   }
 }
 
-/** 初始化：从 IndexedDB 加载任务，按需恢复输入图片，并清理孤立图片 */
+/** 初始化：从后端加载配置与任务，按需恢复输入图片，并清理孤立图片 */
 export async function initStore() {
+  const backendSettings = await loadBackendSettings()
+  if (backendSettings.settings) {
+    backendSettingsHydrating = true
+    try {
+      useStore.getState().setSettings(backendSettings.settings)
+    } finally {
+      backendSettingsHydrating = false
+    }
+  } else {
+    await saveBackendSettings(normalizeSettings(useStore.getState().settings))
+  }
+  backendSettingsPersistenceReady = true
+
   const legacyAgentConversations = normalizeAgentConversations(useStore.getState().agentConversations)
   const storedTasks = await getAllTasks()
   const storedAgentConversations = normalizeAgentConversations(await getAllAgentConversations())
@@ -4543,10 +4578,8 @@ export async function createInputImageFromFile(file: File): Promise<InputImage |
 
 /** 添加图片到输入（右键菜单）—— 支持 data/blob/http URL */
 export async function addImageFromUrl(src: string): Promise<void> {
-  const res = await fetch(src)
-  const blob = await res.blob()
-  if (!blob.type.startsWith('image/')) throw new Error('不是有效的图片')
-  const dataUrl = await blobToDataUrl(blob)
+  const dataUrl = await fetchRemoteImageAsDataUrl(src, 'image/png')
+  if (!dataUrl.startsWith('data:image/')) throw new Error('不是有效的图片')
   const id = await storeImage(dataUrl, 'upload')
   cacheImage(id, dataUrl)
   useStore.getState().addInputImage({ id, dataUrl })
@@ -4558,14 +4591,5 @@ function fileToDataUrl(file: File): Promise<string> {
     reader.onload = () => resolve(reader.result as string)
     reader.onerror = reject
     reader.readAsDataURL(file)
-  })
-}
-
-function blobToDataUrl(blob: Blob): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader()
-    reader.onload = () => resolve(reader.result as string)
-    reader.onerror = reject
-    reader.readAsDataURL(blob)
   })
 }

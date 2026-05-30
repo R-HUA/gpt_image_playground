@@ -1,116 +1,62 @@
-import type { AgentConversation, TaskRecord, StoredImage, StoredImageThumbnail } from '../types'
+import type { AgentConversation, StoredImage, StoredImageThumbnail, TaskRecord } from '../types'
+import { backendAgentConversations, backendImages, backendTasks, backendThumbnails } from './backendApi'
 
-const DB_NAME = 'gpt-image-playground'
-const DB_VERSION = 3
-const STORE_TASKS = 'tasks'
-const STORE_IMAGES = 'images'
-const STORE_THUMBNAILS = 'thumbnails'
-const STORE_AGENT_CONVERSATIONS = 'agentConversations'
 const THUMBNAIL_MAX_SIZE = 720
 const THUMBNAIL_QUALITY = 0.9
 const THUMBNAIL_VERSION = 2
 
 export const CURRENT_THUMBNAIL_VERSION = THUMBNAIL_VERSION
 
-function openDB(): Promise<IDBDatabase> {
-  return new Promise((resolve, reject) => {
-    const req = indexedDB.open(DB_NAME, DB_VERSION)
-    req.onupgradeneeded = (e) => {
-      const db = (e.target as IDBOpenDBRequest).result
-      if (!db.objectStoreNames.contains(STORE_TASKS)) {
-        db.createObjectStore(STORE_TASKS, { keyPath: 'id' })
-      }
-      if (!db.objectStoreNames.contains(STORE_IMAGES)) {
-        db.createObjectStore(STORE_IMAGES, { keyPath: 'id' })
-      }
-      if (!db.objectStoreNames.contains(STORE_THUMBNAILS)) {
-        db.createObjectStore(STORE_THUMBNAILS, { keyPath: 'id' })
-      }
-      if (!db.objectStoreNames.contains(STORE_AGENT_CONVERSATIONS)) {
-        db.createObjectStore(STORE_AGENT_CONVERSATIONS, { keyPath: 'id' })
-      }
-    }
-    req.onsuccess = () => resolve(req.result)
-    req.onerror = () => reject(req.error)
-  })
-}
-
-function dbTransaction<T>(
-  storeName: string,
-  mode: IDBTransactionMode,
-  fn: (store: IDBObjectStore) => IDBRequest<T>,
-): Promise<T> {
-  return openDB().then(
-    (db) =>
-      new Promise((resolve, reject) => {
-        const tx = db.transaction(storeName, mode)
-        const store = tx.objectStore(storeName)
-        const req = fn(store)
-        req.onsuccess = () => resolve(req.result)
-        req.onerror = () => reject(req.error)
-      }),
-  )
-}
-
 // ===== Tasks =====
 
 export function getAllTasks(): Promise<TaskRecord[]> {
-  return dbTransaction(STORE_TASKS, 'readonly', (s) => s.getAll())
+  return backendTasks.list()
 }
 
-export function putTask(task: TaskRecord): Promise<IDBValidKey> {
-  return dbTransaction(STORE_TASKS, 'readwrite', (s) => s.put(task))
+export async function putTask(task: TaskRecord): Promise<IDBValidKey> {
+  await backendTasks.put(task)
+  return task.id
 }
 
-export function deleteTask(id: string): Promise<undefined> {
-  return dbTransaction(STORE_TASKS, 'readwrite', (s) => s.delete(id))
+export function deleteTask(id: string): Promise<void> {
+  return backendTasks.delete(id)
 }
 
-export function clearTasks(): Promise<undefined> {
-  return dbTransaction(STORE_TASKS, 'readwrite', (s) => s.clear())
+export function clearTasks(): Promise<void> {
+  return backendTasks.clear()
 }
 
 // ===== Agent conversations =====
 
 export function getAllAgentConversations(): Promise<AgentConversation[]> {
-  return dbTransaction(STORE_AGENT_CONVERSATIONS, 'readonly', (s) => s.getAll())
+  return backendAgentConversations.list()
 }
 
-export function putAgentConversation(conversation: AgentConversation): Promise<IDBValidKey> {
-  return dbTransaction(STORE_AGENT_CONVERSATIONS, 'readwrite', (s) => s.put(conversation))
+export async function putAgentConversation(conversation: AgentConversation): Promise<IDBValidKey> {
+  await backendAgentConversations.put(conversation)
+  return conversation.id
 }
 
-export function deleteAgentConversation(id: string): Promise<undefined> {
-  return dbTransaction(STORE_AGENT_CONVERSATIONS, 'readwrite', (s) => s.delete(id))
+export function deleteAgentConversation(id: string): Promise<void> {
+  return backendAgentConversations.delete(id)
 }
 
-export function clearAgentConversations(): Promise<undefined> {
-  return dbTransaction(STORE_AGENT_CONVERSATIONS, 'readwrite', (s) => s.clear())
+export function clearAgentConversations(): Promise<void> {
+  return backendAgentConversations.clear()
 }
 
-export function replaceAgentConversations(conversations: AgentConversation[]): Promise<undefined> {
-  return openDB().then(
-    (db) =>
-      new Promise((resolve, reject) => {
-        const tx = db.transaction(STORE_AGENT_CONVERSATIONS, 'readwrite')
-        const store = tx.objectStore(STORE_AGENT_CONVERSATIONS)
-        store.clear()
-        for (const conversation of conversations) store.put(conversation)
-        tx.oncomplete = () => resolve(undefined)
-        tx.onerror = () => reject(tx.error)
-        tx.onabort = () => reject(tx.error)
-      }),
-  )
+export function replaceAgentConversations(conversations: AgentConversation[]): Promise<void> {
+  return backendAgentConversations.replace(conversations)
 }
 
 // ===== Images =====
 
 export function getImage(id: string): Promise<StoredImage | undefined> {
-  return dbTransaction(STORE_IMAGES, 'readonly', (s) => s.get(id))
+  return backendImages.get(id)
 }
 
 export function getStoredImageThumbnail(id: string): Promise<StoredImageThumbnail | undefined> {
-  return dbTransaction(STORE_THUMBNAILS, 'readonly', (s) => s.get(id))
+  return backendThumbnails.get(id)
 }
 
 export async function getStoredFreshImageThumbnail(id: string): Promise<StoredImageThumbnail | undefined> {
@@ -118,37 +64,17 @@ export async function getStoredFreshImageThumbnail(id: string): Promise<StoredIm
   return thumbnail?.thumbnailVersion === THUMBNAIL_VERSION ? thumbnail : undefined
 }
 
-export function putImageThumbnail(thumbnail: StoredImageThumbnail): Promise<IDBValidKey> {
-  return dbTransaction(STORE_THUMBNAILS, 'readwrite', (s) => s.put(thumbnail))
+export async function putImageThumbnail(thumbnail: StoredImageThumbnail): Promise<IDBValidKey> {
+  await backendThumbnails.put(thumbnail)
+  return thumbnail.id
 }
 
 export async function getImageThumbnail(id: string): Promise<StoredImageThumbnail | undefined> {
   const existingThumbnail = await getStoredImageThumbnail(id)
-  if (existingThumbnail?.thumbnailVersion === THUMBNAIL_VERSION) {
-    const image = await getImage(id)
-    if (image && (!image.width || !image.height) && existingThumbnail.width && existingThumbnail.height) {
-      await putImage({ ...image, width: existingThumbnail.width, height: existingThumbnail.height })
-    }
-    return existingThumbnail
-  }
+  if (existingThumbnail?.thumbnailVersion === THUMBNAIL_VERSION) return existingThumbnail
 
   const image = await getImage(id)
   if (!image) return undefined
-  const legacyImage = image as StoredImage & Partial<StoredImageThumbnail>
-  if (legacyImage.thumbnailDataUrl && legacyImage.thumbnailVersion === THUMBNAIL_VERSION) {
-    const thumbnail: StoredImageThumbnail = {
-      id,
-      thumbnailDataUrl: legacyImage.thumbnailDataUrl,
-      width: legacyImage.width,
-      height: legacyImage.height,
-      thumbnailVersion: THUMBNAIL_VERSION,
-    }
-    await putImageThumbnail(thumbnail)
-    if ((!image.width || !image.height) && thumbnail.width && thumbnail.height) {
-      await putImage({ ...image, width: thumbnail.width, height: thumbnail.height })
-    }
-    return thumbnail
-  }
 
   const metadata = await safeCreateImageThumbnail(image.dataUrl)
   if (!metadata.thumbnailDataUrl) return undefined
@@ -167,43 +93,24 @@ export async function getImageThumbnail(id: string): Promise<StoredImageThumbnai
 }
 
 export function getAllImages(): Promise<StoredImage[]> {
-  return dbTransaction(STORE_IMAGES, 'readonly', (s) => s.getAll())
+  return backendImages.list()
 }
 
 export function getAllImageIds(): Promise<string[]> {
-  return dbTransaction(STORE_IMAGES, 'readonly', (s) => s.getAllKeys()).then((keys) =>
-    keys.map(String),
-  )
+  return backendImages.ids()
 }
 
-export function putImage(image: StoredImage): Promise<IDBValidKey> {
-  return dbTransaction(STORE_IMAGES, 'readwrite', (s) => s.put(image))
+export async function putImage(image: StoredImage): Promise<IDBValidKey> {
+  await backendImages.put(image)
+  return image.id
 }
 
-export function deleteImage(id: string): Promise<undefined> {
-  return openDB().then(
-    (db) =>
-      new Promise((resolve, reject) => {
-        const tx = db.transaction([STORE_IMAGES, STORE_THUMBNAILS], 'readwrite')
-        tx.objectStore(STORE_IMAGES).delete(id)
-        tx.objectStore(STORE_THUMBNAILS).delete(id)
-        tx.oncomplete = () => resolve(undefined)
-        tx.onerror = () => reject(tx.error)
-      }),
-  )
+export function deleteImage(id: string): Promise<void> {
+  return backendImages.delete(id)
 }
 
-export function clearImages(): Promise<undefined> {
-  return openDB().then(
-    (db) =>
-      new Promise((resolve, reject) => {
-        const tx = db.transaction([STORE_IMAGES, STORE_THUMBNAILS], 'readwrite')
-        tx.objectStore(STORE_IMAGES).clear()
-        tx.objectStore(STORE_THUMBNAILS).clear()
-        tx.oncomplete = () => resolve(undefined)
-        tx.onerror = () => reject(tx.error)
-      }),
-  )
+export function clearImages(): Promise<void> {
+  return backendImages.clear()
 }
 
 // ===== Image hashing & dedup =====
@@ -236,8 +143,8 @@ function hashDataUrlFallback(dataUrl: string): string {
 }
 
 /**
- * 存储图片，若已存在（按 hash 去重）则跳过。
- * 返回 image id。
+ * Store an image on the authenticated backend. The hash remains content-based so
+ * existing task references keep the same shape as the former IndexedDB ids.
  */
 export async function storeImage(dataUrl: string, source: NonNullable<StoredImage['source']> = 'upload'): Promise<string> {
   const id = await hashDataUrl(dataUrl)
