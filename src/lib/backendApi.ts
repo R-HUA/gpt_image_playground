@@ -204,7 +204,8 @@ export const backendImages = {
   put: (image: StoredImage) => jsonRequest<{ id: string }>(`/api/images/${encodeURIComponent(image.id)}`, jsonInit('PUT', { image })),
   delete: (id: string) => jsonRequest<void>(`/api/images/${encodeURIComponent(id)}`, { method: 'DELETE' }),
   clear: () => jsonRequest<void>('/api/images', { method: 'DELETE' }),
-  store: (dataUrl: string, source: NonNullable<StoredImage['source']>) => jsonRequest<{ id: string }>('/api/images/store', jsonInit('POST', { dataUrl, source })),
+  store: (image: Omit<StoredImage, 'id'> & { thumbnail?: Omit<StoredImageThumbnail, 'id'> }) =>
+    jsonRequest<{ id: string; isNew: boolean }>('/api/images/store', jsonInit('POST', image)),
 }
 
 export const backendThumbnails = {

@@ -491,6 +491,21 @@ function getStoredFile(kind: 'images' | 'thumbnails', userId: number, id: string
   return row ? rowToDataUrl(row, field) : null
 }
 
+function getStoredFileMetadata(kind: 'images' | 'thumbnails', userId: number, id: string) {
+  const table = kind === 'images' ? 'images' : 'thumbnails'
+  const row = db.prepare(`SELECT metadata_json FROM ${table} WHERE user_id = ? AND id = ?`).get(userId, id)
+  return row ? parseJson<JsonRecord>(String(row.metadata_json), {}) : null
+}
+
+function updateStoredFileMetadata(kind: 'images' | 'thumbnails', userId: number, id: string, patch: JsonRecord) {
+  const table = kind === 'images' ? 'images' : 'thumbnails'
+  const metadata = getStoredFileMetadata(kind, userId, id)
+  if (!metadata) return false
+  db.prepare(`UPDATE ${table} SET metadata_json = ?, updated_at = ? WHERE user_id = ? AND id = ?`)
+    .run(JSON.stringify({ ...metadata, ...patch, id }), now(), userId, id)
+  return true
+}
+
 function listStoredFiles(kind: 'images' | 'thumbnails', userId: number) {
   const table = kind === 'images' ? 'images' : 'thumbnails'
   const field = kind === 'images' ? 'dataUrl' : 'thumbnailDataUrl'
@@ -884,9 +899,43 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL) {
     assertMethod(req, 'POST')
     const body = await readJsonBody<JsonRecord>(req)
     const dataUrl = asString(body.dataUrl)
+    if (!dataUrl) throw Object.assign(new Error('缺少图片数据'), { statusCode: 400 })
     const id = createHash('sha256').update(dataUrl).digest('hex')
-    await putStoredFile('images', user.id, id, { id, dataUrl, createdAt: now(), source: asString(body.source, 'upload') }, 'dataUrl')
-    return sendJson(res, 200, { id })
+    const existing = getStoredFile('images', user.id, id)
+    const createdAt = asNumber(body.createdAt, now())
+    const thumbnail = isRecord(body.thumbnail) ? body.thumbnail : null
+    const thumbnailVersion = asNumber(thumbnail?.thumbnailVersion)
+    const existingThumbnail = getStoredFileMetadata('thumbnails', user.id, id)
+    const shouldStoreThumbnail = thumbnail && asString(thumbnail.thumbnailDataUrl) && existingThumbnail?.thumbnailVersion !== thumbnailVersion
+
+    if (!existing) {
+      await putStoredFile('images', user.id, id, {
+        id,
+        dataUrl,
+        createdAt,
+        source: asString(body.source, 'upload'),
+        width: asNumber(body.width),
+        height: asNumber(body.height),
+      }, 'dataUrl')
+    } else if (asNumber(body.width) || asNumber(body.height)) {
+      updateStoredFileMetadata('images', user.id, id, {
+        width: asNumber(body.width, asNumber(existing.width)),
+        height: asNumber(body.height, asNumber(existing.height)),
+      })
+    }
+
+    if (shouldStoreThumbnail) {
+      await putStoredFile('thumbnails', user.id, id, {
+        id,
+        thumbnailDataUrl: asString(thumbnail.thumbnailDataUrl),
+        createdAt,
+        width: asNumber(thumbnail.width, asNumber(body.width)),
+        height: asNumber(thumbnail.height, asNumber(body.height)),
+        thumbnailVersion,
+      }, 'thumbnailDataUrl')
+    }
+
+    return sendJson(res, 200, { id, isNew: !existing })
   }
   if (pathname === '/api/images') {
     if (req.method === 'GET') return sendJson(res, 200, listStoredFiles('images', user.id))
@@ -901,6 +950,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL) {
   }
   if (pathname.startsWith('/api/images/')) {
     const id = decodeURIComponent(pathname.slice('/api/images/'.length))
+    if (!id || id.includes('/')) throw Object.assign(new Error('Not Found'), { statusCode: 404 })
     if (req.method === 'GET') return sendJson(res, 200, getStoredFile('images', user.id, id))
     if (req.method === 'PUT') {
       const body = await readJsonBody<JsonRecord>(req)
@@ -916,6 +966,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL) {
 
   if (pathname.startsWith('/api/thumbnails/')) {
     const id = decodeURIComponent(pathname.slice('/api/thumbnails/'.length))
+    if (!id || id.includes('/')) throw Object.assign(new Error('Not Found'), { statusCode: 404 })
     if (req.method === 'GET') return sendJson(res, 200, getStoredFile('thumbnails', user.id, id))
     if (req.method === 'PUT') {
       const body = await readJsonBody<JsonRecord>(req)
