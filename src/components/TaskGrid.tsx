@@ -126,7 +126,7 @@ export default function TaskGrid() {
   const handleDelete = (task: typeof tasks[0]) => {
     setConfirmDialog({
       title: '删除记录',
-      message: '确定要删除这条记录吗？关联的图片资源也会被清理（如果没有其他任务引用）。',
+      message: '确定要删除这条记录吗？生成结果会从页面隐藏并归档保留，未被其他内容引用的参考图、遮罩和流式临时图会被清理。',
       action: () => {
         void removeTask(task).then(() => {
           setOpenBatchTasks((current) => current.filter((item) => item.id !== task.id))
@@ -168,7 +168,7 @@ export default function TaskGrid() {
       const incompleteCount = batchTasks.filter((task) => task.status === 'queued' || task.status === 'running').length
       setConfirmDialog({
         title: '删除批量任务',
-        message: `确定要删除这个批量任务的 ${taskIds.length} 条记录吗？关联的图片资源也会被清理（如果没有其他任务引用）。${incompleteCount ? `\n其中 ${incompleteCount} 条仍在排队或生成中，删除会取消对应后端任务。` : ''}`,
+        message: `确定要删除这个批量任务的 ${taskIds.length} 条记录吗？生成结果会从页面隐藏并归档保留，未被其他内容引用的参考图、遮罩和流式临时图会被清理。${incompleteCount ? `\n其中 ${incompleteCount} 条仍在排队或生成中，删除会取消对应后端任务。` : ''}`,
         action: () => {
           void removeMultipleTasks(taskIds).then(() => {
             setLoadedBatchTasks((current) => {

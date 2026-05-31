@@ -184,7 +184,7 @@ export default function HistoryModal({ onClose, ignoreOutsideClickRef }: History
       message: '确定要删除这个 Agent 对话吗？',
       checkbox: generatedImageCount > 0
         ? {
-            label: `同时删除对话中生成的图片（${generatedImageCount} 张）`,
+            label: `同时从画廊移除并归档对话中生成的图片（${generatedImageCount} 张）`,
             tone: 'danger',
           }
         : undefined,

@@ -486,7 +486,7 @@ export function FavoriteCollectionsView() {
       message: `确定要删除收藏夹「${collection.name}」吗？`,
       checkbox: imageCount > 0
         ? {
-            label: `同时删除收藏夹中的图片（${imageCount} 张）`,
+            label: `同时从画廊移除并归档收藏夹中的图片（${imageCount} 张）`,
             tone: 'danger',
           }
         : undefined,
@@ -837,7 +837,7 @@ export function FavoriteCollectionPickerModal() {
       message: `确定要删除收藏夹「${collection.name}」吗？`,
       checkbox: imageCount > 0
         ? {
-            label: `同时删除收藏夹中的图片（${imageCount} 张）`,
+            label: `同时从画廊移除并归档收藏夹中的图片（${imageCount} 张）`,
             tone: 'danger',
           }
         : undefined,
@@ -1271,7 +1271,7 @@ export function ManageCollectionsModal() {
       message: `确定要删除收藏夹「${collection.name}」吗？`,
       checkbox: imageCount > 0
         ? {
-            label: `同时删除收藏夹中的图片（${imageCount} 张）`,
+            label: `同时从画廊移除并归档收藏夹中的图片（${imageCount} 张）`,
             tone: 'danger',
           }
         : undefined,

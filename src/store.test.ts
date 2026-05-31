@@ -111,10 +111,10 @@ vi.mock('./lib/agentApi', () => ({
     }
   }),
 }))
-import { clearAgentConversations, clearImages, clearTasks, getAllAgentConversations, getAllTasks, putAgentConversation, putImage, putTask as putDbTask } from './lib/db'
+import { clearAgentConversations, clearImages, clearTasks, getAllAgentConversations, getAllImageIds, getAllTasks, putAgentConversation, putImage, putTask as putDbTask } from './lib/db'
 import { backendGeneration } from './lib/backendApi'
 import { callAgentResponsesApi, callBatchImageSingle } from './lib/agentApi'
-import { cleanStaleAgentInputDrafts, deleteAgentRoundFromConversation, deleteFavoriteCollection, editOutputs, getActiveAgentRounds, getErrorToastMessage, getPersistedState, getTaskApiProfile, importData, initStore, markInterruptedOpenAIRunningTasks, migratePersistedState, regenerateAgentAssistantMessage, remapAgentRoundMentionsForPathChange, removeTask, reuseConfig, submitAgentMessage, submitTask, useStore } from './store'
+import { cleanStaleAgentInputDrafts, deleteAgentRoundFromConversation, deleteFavoriteCollection, editOutputs, getActiveAgentRounds, getErrorToastMessage, getPersistedState, getTaskApiProfile, importData, initStore, markInterruptedOpenAIRunningTasks, migratePersistedState, regenerateAgentAssistantMessage, remapAgentRoundMentionsForPathChange, removeMultipleTasks, removeTask, reuseConfig, submitAgentMessage, submitTask, useStore } from './store'
 
 const imageA = { id: 'image-a', dataUrl: 'data:image/png;base64,a' }
 const imageB = { id: 'image-b', dataUrl: 'data:image/png;base64,b' }
@@ -1179,6 +1179,52 @@ describe('agent context for removed outputs', () => {
     expect(serializedInput).toContain('round-1-image-1')
     expect(serializedInput).toContain('round-1-image-2')
     expect(serializedInput).toContain('input_image')
+  })
+
+  it('keeps generated outputs but removes unreferenced input images when deleting a task', async () => {
+    await clearImages()
+    await putImage({ id: 'input-delete', dataUrl: 'data:image/png;base64,input', source: 'upload' })
+    await putImage({ id: 'out_keep', dataUrl: 'data:image/png;base64,output', source: 'generated' })
+    const deletedTask = task({
+      id: 'task-delete-images',
+      inputImageIds: ['input-delete'],
+      outputImages: ['out_keep'],
+    })
+    useStore.setState({
+      tasks: [deletedTask],
+      inputImages: [],
+      galleryInputDraft: null,
+      agentConversations: [],
+      agentInputDrafts: {},
+      showToast: vi.fn(),
+    })
+
+    await removeTask(deletedTask)
+
+    expect(await getAllImageIds()).toEqual(['out_keep'])
+  })
+
+  it('keeps generated outputs but removes unreferenced inputs when deleting multiple tasks', async () => {
+    await clearImages()
+    await putImage({ id: 'input-batch-delete', dataUrl: 'data:image/png;base64,input', source: 'upload' })
+    await putImage({ id: 'out_batch_keep', dataUrl: 'data:image/png;base64,output', source: 'generated' })
+    const deletedTask = task({
+      id: 'task-batch-delete-images',
+      inputImageIds: ['input-batch-delete'],
+      outputImages: ['out_batch_keep'],
+    })
+    useStore.setState({
+      tasks: [deletedTask],
+      inputImages: [],
+      galleryInputDraft: null,
+      agentConversations: [],
+      agentInputDrafts: {},
+      showToast: vi.fn(),
+    })
+
+    await removeMultipleTasks([deletedTask.id])
+
+    expect(await getAllImageIds()).toEqual(['out_batch_keep'])
   })
 
   it('restores stripped image_generation results from task payloads when building context', async () => {

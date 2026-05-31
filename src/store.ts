@@ -3070,6 +3070,13 @@ function addTaskReferencedImageIds(target: Set<string>, task: TaskRecord) {
   for (const id of task.streamPartialImageIds || []) target.add(id)
 }
 
+function addTaskCleanupImageIds(target: Set<string>, task: TaskRecord) {
+  for (const id of task.inputImageIds || []) target.add(id)
+  if (task.maskImageId) target.add(task.maskImageId)
+  if (task.maskTargetImageId) target.add(task.maskTargetImageId)
+  for (const id of task.streamPartialImageIds || []) target.add(id)
+}
+
 async function deleteUnreferencedImageIds(imageIds: Iterable<string>) {
   const candidates = Array.from(new Set(Array.from(imageIds).filter(Boolean)))
   if (candidates.length === 0) return
@@ -4862,18 +4869,18 @@ export async function editOutputs(task: TaskRecord) {
 /** 删除多条任务 */
 export async function removeMultipleTasks(taskIds: string[]) {
   const { tasks, setTasks, inputImages, galleryInputDraft, showToast, clearSelection, selectedTaskIds } = useStore.getState()
-  
+
   if (!taskIds.length) return
 
   const toDelete = new Set(taskIds)
   const deletedTasks = tasks.filter(t => toDelete.has(t.id))
   const remaining = await scrubAgentOutputPayloadsForDeletedTasks(deletedTasks, tasks.filter(t => !toDelete.has(t.id)))
 
-  // 收集所有被删除任务的关联图片
+  // 生成结果由后端归档保留，这里只清理输入图、遮罩和流式临时图。
   const deletedImageIds = new Set<string>()
   for (const t of tasks) {
     if (toDelete.has(t.id)) {
-      addTaskReferencedImageIds(deletedImageIds, t)
+      addTaskCleanupImageIds(deletedImageIds, t)
     }
   }
 
@@ -4891,12 +4898,11 @@ export async function removeMultipleTasks(taskIds: string[]) {
   addInputDraftReferencedImageIds(stillUsed, galleryInputDraft)
   for (const img of inputImages) stillUsed.add(img.id)
 
-  // 删除孤立图片
+  // 删除孤立的输入图、遮罩和流式临时图；缩略图保留供管理接口查看。
   for (const imgId of deletedImageIds) {
     if (!stillUsed.has(imgId)) {
       await deleteImage(imgId)
       imageCache.delete(imgId)
-      thumbnailCache.delete(imgId)
     }
   }
 
@@ -4913,13 +4919,9 @@ export async function removeMultipleTasks(taskIds: string[]) {
 export async function removeTask(task: TaskRecord) {
   const { tasks, setTasks, inputImages, galleryInputDraft, showToast } = useStore.getState()
 
-  // 收集此任务关联的图片
-  const taskImageIds = new Set([
-    ...(task.inputImageIds || []),
-    ...(task.maskImageId ? [task.maskImageId] : []),
-    ...(task.outputImages || []),
-    ...(task.streamPartialImageIds || []),
-  ])
+  // 生成结果由后端归档保留，这里只清理输入图、遮罩和流式临时图。
+  const taskImageIds = new Set<string>()
+  addTaskCleanupImageIds(taskImageIds, task)
 
   // 从列表移除
   const remaining = await scrubAgentOutputPayloadsForDeletedTasks([task], tasks.filter((t) => t.id !== task.id))
@@ -4935,12 +4937,11 @@ export async function removeTask(task: TaskRecord) {
   addInputDraftReferencedImageIds(stillUsed, galleryInputDraft)
   for (const img of inputImages) stillUsed.add(img.id)
 
-  // 删除孤立图片
+  // 删除孤立的输入图、遮罩和流式临时图；缩略图保留供管理接口查看。
   for (const imgId of taskImageIds) {
     if (!stillUsed.has(imgId)) {
       await deleteImage(imgId)
       imageCache.delete(imgId)
-      thumbnailCache.delete(imgId)
     }
   }
 

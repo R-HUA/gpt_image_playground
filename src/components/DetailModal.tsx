@@ -270,7 +270,7 @@ export default function DetailModal() {
     setDetailTaskId(null)
     setConfirmDialog({
       title: '删除任务',
-      message: '确定要删除这个任务吗？关联的图片资源也会被清理（如果没有其他任务引用）。',
+      message: '确定要删除这个任务吗？生成结果会从页面隐藏并归档保留，未被其他内容引用的参考图、遮罩和流式临时图会被清理。',
       action: () => removeTask(task),
     })
   }

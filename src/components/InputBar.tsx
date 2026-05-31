@@ -654,7 +654,7 @@ export default function InputBar() {
       message: `确定要删除选中的 ${selectedCollections.length} 个收藏夹吗？`,
       checkbox: imageCount > 0
         ? {
-            label: `同时删除收藏夹中的图片（${imageCount} 张）`,
+            label: `同时从画廊移除并归档收藏夹中的图片（${imageCount} 张）`,
             tone: 'danger',
           }
         : undefined,

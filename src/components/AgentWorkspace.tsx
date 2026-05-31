@@ -616,7 +616,7 @@ export default function AgentWorkspace() {
       message: '确定要删除这个 Agent 对话吗？',
       checkbox: generatedImageCount > 0
         ? {
-            label: `同时删除对话中生成的图片（${generatedImageCount} 张）`,
+            label: `同时从画廊移除并归档对话中生成的图片（${generatedImageCount} 张）`,
             tone: 'danger',
           }
         : undefined,
@@ -712,8 +712,8 @@ export default function AgentWorkspace() {
     setConfirmDialog({
       title: isUserMessage ? '删除轮次' : '删除消息',
       message: isUserMessage
-        ? '确定要删除这轮任务吗？这会删除这条消息和它的输出，后续消息会被保留。'
-        : '确定要删除这条消息吗？这会同时删除这条回复生成的图片。',
+        ? '确定要删除这轮任务吗？这会删除这条消息和它的输出记录，生成结果会归档保留，后续消息会被保留。'
+        : '确定要删除这条消息吗？这会从画廊移除这条回复生成的图片并归档保留。',
       action: async () => {
         if (isUserMessage) {
           if (round.outputTaskIds.length > 0) await removeMultipleTasks(round.outputTaskIds)
