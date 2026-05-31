@@ -664,6 +664,7 @@ describe('callImageApi', () => {
       settings: {
         ...DEFAULT_SETTINGS,
         baseUrl: 'https://api.example.com/v1',
+        apiKey: 'test-key',
         customProviders: [{
           id: 'custom-async',
           name: 'Custom Async',
@@ -698,6 +699,7 @@ describe('callImageApi', () => {
           apiKey: 'test-key',
           model: 'model',
           timeout: 60,
+          apiProxy: false,
         }],
         activeProfileId: 'profile-custom',
       },

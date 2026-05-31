@@ -1,6 +1,7 @@
 import { DEFAULT_STREAM_PARTIAL_IMAGES, type ApiProfile, type CustomProviderDefinition, type CustomProviderPollMapping, type CustomProviderResultMapping, type CustomProviderSubmitMapping, type ImageApiResponse, type ImageResponseItem, type ResponsesApiResponse, type ResponsesOutputItem, type TaskParams } from '../types'
 import { dataUrlToBlob, imageDataUrlToPngBlob, maskDataUrlToPngBlob } from './canvasImage'
 import { fetchRemoteImageAsDataUrl, providerJsonFetch, providerMultipartFetch } from './backendApi'
+import { shouldUseApiProxy } from './devProxy'
 import {
   assertImageInputPayloadSize,
   assertMaskEditFileSize,
@@ -469,6 +470,10 @@ async function parseResponsesApiStreamResponse(
 
 export async function callOpenAICompatibleImageApi(opts: CallApiOptions, profile: ApiProfile, customProvider?: CustomProviderDefinition | null): Promise<CallApiResult> {
   if (customProvider) {
+    const submitMapping = opts.inputImageDataUrls.length > 0 && customProvider.editSubmit ? customProvider.editSubmit : customProvider.submit
+    if (submitMapping.taskIdPath && shouldUseApiProxy(Boolean(profile.apiProxy))) {
+      throw new Error('异步任务的自定义服务商不支持 API proxy，请关闭代理或使用同步接口。')
+    }
     return callCustomHttpImageApi(opts, profile, customProvider)
   }
 

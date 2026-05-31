@@ -14,6 +14,9 @@ vi.mock('./lib/db', () => {
   return {
     CURRENT_THUMBNAIL_VERSION: 2,
     getAllTasks: async () => [...tasks.values()],
+    listTasks: async () => ({ items: [...tasks.values()], nextCursor: undefined }),
+    getTask: async (id: string) => tasks.get(id) ?? null,
+    getIncompleteTasks: async () => [...tasks.values()].filter((task) => task.status === 'queued' || task.status === 'running'),
     putTask: async (task: TaskRecord) => {
       tasks.set(task.id, task)
       return task.id
@@ -67,6 +70,17 @@ vi.mock('./lib/db', () => {
     },
   }
 })
+vi.mock('./lib/backendApi', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./lib/backendApi')>()
+  return {
+    ...actual,
+    loadBackendSettings: vi.fn(async () => ({ exists: false, settings: null })),
+    saveBackendSettings: vi.fn(async (settings) => settings),
+    backendGeneration: {
+      createTask: vi.fn(async (task: TaskRecord) => ({ task })),
+    },
+  }
+})
 vi.mock('./lib/api', () => ({
   callImageApi: vi.fn(async () => ({
     images: [],
@@ -96,6 +110,7 @@ vi.mock('./lib/agentApi', () => ({
   }),
 }))
 import { clearAgentConversations, clearImages, getAllAgentConversations, getAllTasks, putAgentConversation, putImage, putTask as putDbTask } from './lib/db'
+import { backendGeneration } from './lib/backendApi'
 import { callAgentResponsesApi, callBatchImageSingle } from './lib/agentApi'
 import { cleanStaleAgentInputDrafts, deleteAgentRoundFromConversation, editOutputs, getActiveAgentRounds, getErrorToastMessage, getPersistedState, getTaskApiProfile, importData, initStore, markInterruptedOpenAIRunningTasks, migratePersistedState, regenerateAgentAssistantMessage, remapAgentRoundMentionsForPathChange, removeTask, reuseConfig, submitAgentMessage, submitTask, useStore } from './store'
 
@@ -206,7 +221,9 @@ describe('mask draft lifecycle in store actions', () => {
 
     const state = useStore.getState()
     expect(state.tasks).toHaveLength(1)
-    expect(state.showToast).toHaveBeenCalledWith('任务已提交', 'success')
+    expect(state.tasks[0].status).toBe('queued')
+    expect(backendGeneration.createTask).toHaveBeenCalled()
+    expect(state.showToast).toHaveBeenCalledWith('任务已提交队列', 'success')
   })
 
   it('preserves selected image mentions when replacing a mask target with an equivalent image id', () => {
@@ -1361,6 +1378,7 @@ describe('agent batch reference resolution', () => {
     await putImage(imageB)
     vi.mocked(callAgentResponsesApi).mockClear()
     vi.mocked(callBatchImageSingle).mockClear()
+    vi.mocked(backendGeneration.createTask).mockClear()
     useStore.setState({
       settings: normalizeSettings({
         ...DEFAULT_SETTINGS,
@@ -1468,14 +1486,16 @@ describe('agent batch reference resolution', () => {
 
     await submitAgentMessage()
 
-    for (let i = 0; i < 5 && vi.mocked(callBatchImageSingle).mock.calls.length === 0; i++) {
+    for (let i = 0; i < 5 && vi.mocked(backendGeneration.createTask).mock.calls.length === 0; i++) {
       await new Promise((resolve) => setTimeout(resolve, 0))
     }
-    expect(callBatchImageSingle).toHaveBeenCalled()
-    const batchArgs = vi.mocked(callBatchImageSingle).mock.calls[0][0]
-    expect(batchArgs.referenceImageDataUrls).toEqual([imageB.dataUrl])
-    expect(batchArgs.referenceImageDataUrls).not.toContain(imageA.dataUrl)
-    expect(batchArgs.referenceIds).toEqual(['round-2-image-1'])
+    expect(backendGeneration.createTask).toHaveBeenCalled()
+    const [, request] = vi.mocked(backendGeneration.createTask).mock.calls.find(([, request]) =>
+      request.referenceIds?.includes('round-2-image-1'),
+    )!
+    expect(request.inputImageIds).toEqual([imageB.id])
+    expect(request.inputImageIds).not.toContain(imageA.id)
+    expect(request.referenceIds).toEqual(['round-2-image-1'])
   })
 
   it('resolves batch references to current round input images', async () => {
@@ -1506,13 +1526,15 @@ describe('agent batch reference resolution', () => {
 
     await submitAgentMessage()
 
-    for (let i = 0; i < 5 && vi.mocked(callBatchImageSingle).mock.calls.length === 0; i++) {
+    for (let i = 0; i < 5 && vi.mocked(backendGeneration.createTask).mock.calls.length === 0; i++) {
       await new Promise((resolve) => setTimeout(resolve, 0))
     }
-    expect(callBatchImageSingle).toHaveBeenCalled()
-    const batchArgs = vi.mocked(callBatchImageSingle).mock.calls[0][0]
-    expect(batchArgs.referenceImageDataUrls).toEqual([imageA.dataUrl])
-    expect(batchArgs.referenceIds).toEqual(['round-3-reference-1'])
+    expect(backendGeneration.createTask).toHaveBeenCalled()
+    const [, request] = vi.mocked(backendGeneration.createTask).mock.calls.find(([, request]) =>
+      request.referenceIds?.includes('round-3-reference-1'),
+    )!
+    expect(request.inputImageIds).toEqual([imageA.id])
+    expect(request.referenceIds).toEqual(['round-3-reference-1'])
   })
 })
 

@@ -231,11 +231,12 @@ export default function DetailModal() {
 
   const formatDuration = () => {
     if (task.status === 'running' || isFalReconnecting || isCustomReconnecting) {
-      const seconds = Math.max(0, Math.floor((now - task.createdAt) / 1000))
+      const seconds = Math.max(0, Math.floor((now - (task.startedAt ?? task.createdAt)) / 1000))
       const mm = String(Math.floor(seconds / 60)).padStart(2, '0')
       const ss = String(seconds % 60).padStart(2, '0')
       return `${mm}:${ss}`
     }
+    if (task.status === 'queued') return null
     if (task.elapsed == null) return null
     const seconds = Math.floor(task.elapsed / 1000)
     const mm = String(Math.floor(seconds / 60)).padStart(2, '0')
@@ -575,6 +576,17 @@ export default function DetailModal() {
                 </svg>
               )}
             </>
+          )}
+          {task.status === 'queued' && (
+            <div className="flex flex-col items-center gap-3 text-gray-500 dark:text-gray-400">
+              <svg className="h-12 w-12" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.8} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+              </svg>
+              <div className="text-center">
+                <p className="text-sm font-medium">任务排队中{task.queuePosition ? ` #${task.queuePosition}` : ''}</p>
+                <p className="mt-1 text-xs">开始运行后才会计时</p>
+              </div>
+            </div>
           )}
           {task.status === 'error' && isFalReconnecting && (
             <div className="w-full max-w-md px-4 text-center">

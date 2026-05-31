@@ -1,6 +1,9 @@
 import { useMemo, useRef, useState, useEffect } from 'react'
-import { useStore, reuseConfig, editOutputs, removeTask } from '../store'
+import { useStore, reuseConfig, editOutputs, removeTask, loadMoreTasksFromServer, loadBatchTasksFromServer } from '../store'
+import type { TaskRecord } from '../types'
 import TaskCard from './TaskCard'
+import BatchTaskCard from './BatchTaskCard'
+import BatchTaskModal from './BatchTaskModal'
 
 export default function TaskGrid() {
   const tasks = useStore((s) => s.tasks)
@@ -12,9 +15,14 @@ export default function TaskGrid() {
   const selectedTaskIds = useStore((s) => s.selectedTaskIds)
   const setSelectedTaskIds = useStore((s) => s.setSelectedTaskIds)
   const clearSelection = useStore((s) => s.clearSelection)
+  const taskNextCursor = useStore((s) => s.taskNextCursor)
+  const tasksLoadingMore = useStore((s) => s.tasksLoadingMore)
   const rootRef = useRef<HTMLDivElement>(null)
   const gridRef = useRef<HTMLDivElement>(null)
   const [selectionBox, setSelectionBox] = useState<{ startPageX: number; startPageY: number; currentPageX: number; currentPageY: number } | null>(null)
+  const [openBatchGroupId, setOpenBatchGroupId] = useState<string | null>(null)
+  const [openBatchTasks, setOpenBatchTasks] = useState<TaskRecord[]>([])
+  const [batchLoadingGroupId, setBatchLoadingGroupId] = useState<string | null>(null)
   const dragStart = useRef<{ pageX: number; pageY: number } | null>(null)
   const lastClientPoint = useRef<{ x: number; y: number } | null>(null)
   const hasDragged = useRef(false)
@@ -28,21 +36,42 @@ export default function TaskGrid() {
   const initialSelection = useRef<string[]>([])
   const isMac = /Mac|iPod|iPhone|iPad/.test(navigator.platform)
 
-  const filteredTasks = useMemo(() => {
+  const visibleItems = useMemo(() => {
     const sorted = [...tasks].sort((a, b) => b.createdAt - a.createdAt)
-    const q = searchQuery.trim().toLowerCase()
-    
-    return sorted.filter((t) => {
-      if (filterFavorite && !t.isFavorite) return false
-      const matchStatus = filterStatus === 'all' || t.status === filterStatus
-      if (!matchStatus) return false
-      
-      if (!q) return true
-      const prompt = (t.prompt || '').toLowerCase()
-      const paramStr = JSON.stringify(t.params).toLowerCase()
-      return prompt.includes(q) || paramStr.includes(q)
+    const groups = new Map<string, typeof tasks>()
+    const items: Array<{ type: 'task'; task: typeof tasks[0] } | { type: 'batch'; groupId: string; tasks: typeof tasks }> = []
+    for (const task of sorted) {
+      if (task.batchGroupId && task.batchKind === 'gallery-image-to-image') {
+        const group = groups.get(task.batchGroupId) ?? []
+        group.push(task)
+        groups.set(task.batchGroupId, group)
+        continue
+      }
+      items.push({ type: 'task', task })
+    }
+    for (const [groupId, groupTasks] of groups) {
+      items.push({ type: 'batch', groupId, tasks: groupTasks })
+    }
+    return items.sort((a, b) => {
+      const aTime = a.type === 'task' ? a.task.createdAt : Math.max(...a.tasks.map((task) => task.createdAt))
+      const bTime = b.type === 'task' ? b.task.createdAt : Math.max(...b.tasks.map((task) => task.createdAt))
+      return bTime - aTime
     })
-  }, [tasks, searchQuery, filterStatus, filterFavorite])
+  }, [tasks])
+  const visibleTaskIds = useMemo(() => visibleItems.flatMap((item) => item.type === 'task' ? [item.task.id] : item.tasks.map((task) => task.id)), [visibleItems])
+
+  const openBatch = (groupId: string, fallbackTasks: TaskRecord[]) => {
+    setOpenBatchGroupId(groupId)
+    setOpenBatchTasks(fallbackTasks)
+    setBatchLoadingGroupId(groupId)
+    void loadBatchTasksFromServer(groupId)
+      .then((batchTasks) => {
+        if (useStore.getState().tasks.some((task) => task.batchGroupId === groupId)) {
+          setOpenBatchTasks(batchTasks)
+        }
+      })
+      .finally(() => setBatchLoadingGroupId((current) => current === groupId ? null : current))
+  }
 
   const handleDelete = (task: typeof tasks[0]) => {
     setConfirmDialog({
@@ -93,8 +122,11 @@ export default function TaskGrid() {
 
     cards.forEach((card) => {
       const rect = card.getBoundingClientRect()
-      const taskId = card.getAttribute('data-task-id')
-      if (!taskId) return
+      const taskIds = (card.getAttribute('data-batch-task-ids') || card.getAttribute('data-task-id') || '')
+        .split(',')
+        .map((id) => id.trim())
+        .filter(Boolean)
+      if (!taskIds.length) return
 
       const cardLeft = rect.left + window.scrollX
       const cardRight = rect.right + window.scrollX
@@ -105,13 +137,16 @@ export default function TaskGrid() {
         minX < cardRight && maxX > cardLeft && minY < cardBottom && maxY > cardTop
 
       if (isIntersecting) {
-        if (initialSelected.has(taskId)) {
-          newSelected.delete(taskId)
+        const allInitiallySelected = taskIds.every((taskId) => initialSelected.has(taskId))
+        if (allInitiallySelected) {
+          for (const taskId of taskIds) newSelected.delete(taskId)
         } else {
-          newSelected.add(taskId)
+          for (const taskId of taskIds) newSelected.add(taskId)
         }
-      } else if (!initialSelected.has(taskId)) {
-        newSelected.delete(taskId)
+      } else {
+        for (const taskId of taskIds) {
+          if (!initialSelected.has(taskId)) newSelected.delete(taskId)
+        }
       }
     })
 
@@ -253,10 +288,10 @@ export default function TaskGrid() {
     }
   }, [clearSelection, isMac])
 
-  if (!filteredTasks.length) {
+  if (!visibleItems.length) {
     return (
       <div className="text-center py-20 text-gray-400 dark:text-gray-500">
-        {searchQuery || filterFavorite ? (
+        {searchQuery || filterFavorite || filterStatus !== 'all' ? (
           <p className="text-sm">没有找到匹配的记录</p>
         ) : (
           <>
@@ -287,32 +322,82 @@ export default function TaskGrid() {
       className="relative min-h-[50vh]"
     >
       <div ref={gridRef} className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4 pb-10">
-        {filteredTasks.map((task) => (
-          <div key={task.id} className="task-card-wrapper" data-task-id={task.id}>
-            <TaskCard
-              task={task}
-              onClick={(e) => {
-                if (Date.now() < suppressClickUntil.current) {
-                  e.preventDefault()
-                  return
-                }
-                suppressClickUntil.current = 0
-                const isCtrl = isMac ? e.metaKey : e.ctrlKey
-                if (isCtrl) {
-                  useStore.getState().toggleTaskSelection(task.id)
-                  return
-                }
+        {visibleItems.map((item) => {
+          if (item.type === 'batch') {
+            const selected = item.tasks.some((task) => selectedTaskIds.includes(task.id))
+            return (
+              <div
+                key={item.groupId}
+                className="task-card-wrapper"
+                data-batch-task-ids={item.tasks.map((task) => task.id).join(',')}
+              >
+                <BatchTaskCard
+                  tasks={item.tasks}
+                  isSelected={selected}
+                  onClick={(e) => {
+                    if (Date.now() < suppressClickUntil.current) {
+                      e.preventDefault()
+                      return
+                    }
+                    suppressClickUntil.current = 0
+                    const isCtrl = isMac ? e.metaKey : e.ctrlKey
+                    if (isCtrl) {
+                      const ids = item.tasks.map((task) => task.id)
+                      const allSelected = ids.every((id) => selectedTaskIds.includes(id))
+                      useStore.getState().setSelectedTaskIds((current) =>
+                        allSelected ? current.filter((id) => !ids.includes(id)) : [...new Set([...current, ...ids])],
+                      )
+                      return
+                    }
+                    openBatch(item.groupId, item.tasks)
+                  }}
+                />
+              </div>
+            )
+          }
+          const task = item.task
+          return (
+            <div key={task.id} className="task-card-wrapper" data-task-id={task.id}>
+              <TaskCard
+                task={task}
+                onClick={(e) => {
+                  if (Date.now() < suppressClickUntil.current) {
+                    e.preventDefault()
+                    return
+                  }
+                  suppressClickUntil.current = 0
+                  const isCtrl = isMac ? e.metaKey : e.ctrlKey
+                  if (isCtrl) {
+                    useStore.getState().toggleTaskSelection(task.id)
+                    return
+                  }
 
-                setDetailTaskId(task.id)
-              }}
-              onReuse={() => reuseConfig(task)}
-              onEditOutputs={() => editOutputs(task)}
-              onDelete={() => handleDelete(task)}
-              isSelected={selectedTaskIds.includes(task.id)}
-            />
-          </div>
-        ))}
+                  setDetailTaskId(task.id)
+                }}
+                onReuse={() => reuseConfig(task)}
+                onEditOutputs={() => editOutputs(task)}
+                onDelete={() => handleDelete(task)}
+                isSelected={selectedTaskIds.includes(task.id)}
+              />
+            </div>
+          )
+        })}
       </div>
+      {openBatchGroupId && openBatchTasks.length > 0 && (
+        <BatchTaskModal
+          tasks={openBatchTasks}
+          loading={batchLoadingGroupId === openBatchGroupId}
+          selectedTaskIds={selectedTaskIds}
+          onClose={() => {
+            setOpenBatchGroupId(null)
+            setOpenBatchTasks([])
+          }}
+          onTaskClick={(task) => setDetailTaskId(task.id)}
+          onReuse={(task) => reuseConfig(task)}
+          onEditOutputs={(task) => editOutputs(task)}
+          onDelete={(task) => handleDelete(task)}
+        />
+      )}
       {selectionBox && (
         <div
           className="fixed bg-blue-500/20 border border-blue-500/50 pointer-events-none z-[30]"
@@ -323,6 +408,18 @@ export default function TaskGrid() {
             height: Math.abs(selectionBox.currentPageY - selectionBox.startPageY),
           }}
         />
+      )}
+      {taskNextCursor && (
+        <div className="flex justify-center pb-12">
+          <button
+            type="button"
+            disabled={tasksLoadingMore}
+            onClick={() => void loadMoreTasksFromServer()}
+            className="rounded-xl border border-gray-200 bg-white px-4 py-2 text-sm text-gray-600 transition hover:bg-gray-50 disabled:cursor-not-allowed disabled:opacity-60 dark:border-white/[0.08] dark:bg-gray-900 dark:text-gray-300 dark:hover:bg-white/[0.06]"
+          >
+            {tasksLoadingMore ? '加载中...' : '加载更多'}
+          </button>
+        </div>
       )}
     </div>
   )

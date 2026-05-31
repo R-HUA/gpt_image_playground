@@ -1,5 +1,6 @@
 import type { AgentConversation, AppSettings, ApiProfile, StoredImage, StoredImageThumbnail, TaskParams, TaskRecord } from '../types'
 import type { CallApiOptions, CallApiResult } from './imageApiShared'
+import { buildApiUrl, readClientDevProxyConfig, shouldUseApiProxy } from './devProxy'
 
 export const SERVER_API_KEY_PLACEHOLDER = '__server_stored_api_key__'
 
@@ -20,25 +21,57 @@ interface AuthResponse {
 
 type JsonValue = Record<string, unknown> | unknown[] | string | number | boolean | null
 
+export interface TaskPage {
+  items: TaskRecord[]
+  nextCursor?: string
+}
+
+export interface TaskListQuery {
+  limit?: number
+  cursor?: string
+  q?: string
+  status?: string
+  favorite?: boolean
+}
+
+export interface GenerationRequest {
+  profile: ApiProfile
+  settings?: AppSettings
+  prompt: string
+  params: TaskParams
+  inputImageIds: string[]
+  maskImageId?: string | null
+  referenceIds?: string[]
+  agentBatchItemId?: string
+}
+
 function getApiBaseUrl() {
   return ''
 }
 
+function isTestRuntime() {
+  return typeof process !== 'undefined' && process.env.NODE_ENV === 'test'
+}
+
 function readAccessToken() {
+  if (typeof localStorage === 'undefined') return ''
   return localStorage.getItem(ACCESS_TOKEN_KEY) || ''
 }
 
 function readRefreshToken() {
+  if (typeof localStorage === 'undefined') return ''
   return localStorage.getItem(REFRESH_TOKEN_KEY) || ''
 }
 
 function writeAuth(auth: AuthResponse) {
+  if (typeof localStorage === 'undefined') return
   localStorage.setItem(ACCESS_TOKEN_KEY, auth.accessToken)
   localStorage.setItem(REFRESH_TOKEN_KEY, auth.refreshToken)
   localStorage.setItem(AUTH_USER_KEY, JSON.stringify(auth.user))
 }
 
 export function getStoredAuthUser(): AuthUser | null {
+  if (typeof localStorage === 'undefined') return null
   try {
     const raw = localStorage.getItem(AUTH_USER_KEY)
     return raw ? JSON.parse(raw) as AuthUser : null
@@ -48,6 +81,7 @@ export function getStoredAuthUser(): AuthUser | null {
 }
 
 export function clearAuthTokens() {
+  if (typeof localStorage === 'undefined') return
   localStorage.removeItem(ACCESS_TOKEN_KEY)
   localStorage.removeItem(REFRESH_TOKEN_KEY)
   localStorage.removeItem(AUTH_USER_KEY)
@@ -58,7 +92,30 @@ export function isBackendAuthenticated() {
 }
 
 function apiUrl(path: string) {
-  return `${getApiBaseUrl()}${path}`
+  const url = `${getApiBaseUrl()}${path}`
+  if (typeof window === 'undefined' && url.startsWith('/')) return `http://localhost${url}`
+  return url
+}
+
+function shouldBypassBackendProxyForTests(profile: ApiProfile) {
+  return typeof localStorage === 'undefined' && isTestRuntime() && !readAccessToken() && !readRefreshToken() && profile.apiKey
+}
+
+function buildProviderUrl(profile: ApiProfile, path: string) {
+  const defaultBaseUrl = profile.provider === 'fal' ? 'https://fal.run' : 'https://api.openai.com/v1'
+  return buildApiUrl(
+    profile.baseUrl || defaultBaseUrl,
+    path,
+    readClientDevProxyConfig(),
+    shouldUseApiProxy(Boolean(profile.apiProxy)),
+  )
+}
+
+function providerHeaders(profile: ApiProfile, contentType?: string) {
+  const headers: Record<string, string> = {}
+  if (profile.apiKey) headers.Authorization = `Bearer ${profile.apiKey}`
+  if (contentType) headers['Content-Type'] = contentType
+  return headers
 }
 
 async function refreshAccessToken(): Promise<boolean> {
@@ -153,7 +210,7 @@ export async function getCurrentUser(): Promise<AuthUser | null> {
   }
   if (!response.ok) return null
   const payload = await response.json() as { user: AuthUser }
-  localStorage.setItem(AUTH_USER_KEY, JSON.stringify(payload.user))
+  if (typeof localStorage !== 'undefined') localStorage.setItem(AUTH_USER_KEY, JSON.stringify(payload.user))
   return payload.user
 }
 
@@ -183,10 +240,27 @@ export function redactSettingsForLocalStorage(settings: AppSettings): AppSetting
 }
 
 export const backendTasks = {
-  list: () => jsonRequest<TaskRecord[]>('/api/tasks'),
+  list: (query: TaskListQuery = {}) => {
+    const params = new URLSearchParams()
+    if (query.limit != null) params.set('limit', String(query.limit))
+    if (query.cursor) params.set('cursor', query.cursor)
+    if (query.q) params.set('q', query.q)
+    if (query.status && query.status !== 'all') params.set('status', query.status)
+    if (query.favorite) params.set('favorite', 'true')
+    const suffix = params.toString() ? `?${params.toString()}` : ''
+    return jsonRequest<TaskPage>(`/api/tasks${suffix}`)
+  },
+  get: (id: string) => jsonRequest<TaskRecord | null>(`/api/tasks/${encodeURIComponent(id)}`),
+  batch: (batchGroupId: string) => jsonRequest<TaskRecord[]>(`/api/tasks/batch/${encodeURIComponent(batchGroupId)}`),
+  incomplete: () => jsonRequest<TaskRecord[]>('/api/tasks/incomplete'),
   put: (task: TaskRecord) => jsonRequest<{ id: string }>(`/api/tasks/${encodeURIComponent(task.id)}`, jsonInit('PUT', { task })),
   delete: (id: string) => jsonRequest<void>(`/api/tasks/${encodeURIComponent(id)}`, { method: 'DELETE' }),
   clear: () => jsonRequest<void>('/api/tasks', { method: 'DELETE' }),
+}
+
+export const backendGeneration = {
+  createTask: (task: TaskRecord, request: GenerationRequest) =>
+    jsonRequest<{ task: TaskRecord }>('/api/generation/tasks', jsonInit('POST', { task, request })),
 }
 
 export const backendAgentConversations = {
@@ -227,6 +301,25 @@ export async function providerJsonFetch(
   method = 'POST',
   signal?: AbortSignal,
 ): Promise<Response> {
+  if (shouldBypassBackendProxyForTests(profile)) {
+    const useApiProxy = shouldUseApiProxy(Boolean(profile.apiProxy))
+    const defaultBaseUrl = profile.provider === 'fal' ? 'https://fal.run' : 'https://api.openai.com/v1'
+    if (method === 'GET' && !useApiProxy) {
+      return fetch(buildApiUrl(profile.baseUrl || defaultBaseUrl, path), {
+        method,
+        headers: providerHeaders(profile),
+        signal,
+        cache: 'no-store',
+      })
+    }
+    return fetch(buildProviderUrl(profile, path), {
+      method,
+      headers: providerHeaders(profile, method === 'GET' || body === undefined ? undefined : 'application/json'),
+      body: method === 'GET' || body === undefined ? undefined : JSON.stringify(body),
+      signal,
+      cache: 'no-store',
+    })
+  }
   return authFetch(apiUrl('/api/provider/json'), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -242,6 +335,14 @@ export async function providerMultipartFetch(
   signal?: AbortSignal,
   method = 'POST',
 ): Promise<Response> {
+  if (shouldBypassBackendProxyForTests(profile)) {
+    return fetch(buildProviderUrl(profile, path), {
+      method,
+      headers: providerHeaders(profile),
+      body: method === 'GET' ? undefined : body,
+      signal,
+    })
+  }
   return authFetch(apiUrl('/api/provider/multipart'), {
     method: 'POST',
     headers: {

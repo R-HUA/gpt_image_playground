@@ -40,6 +40,8 @@ export interface CustomProviderPollMapping {
   method?: CustomProviderRequestMethod
   query?: Record<string, string>
   intervalSeconds?: number
+  timeoutSeconds?: number
+  maxAttempts?: number
   statusPath: string
   successValues: string[]
   failureValues: string[]
@@ -136,7 +138,7 @@ export interface MaskDraft {
 
 // ===== 任务记录 =====
 
-export type TaskStatus = 'running' | 'done' | 'error'
+export type TaskStatus = 'queued' | 'running' | 'done' | 'error'
 
 export interface TaskRecord {
   id: string
@@ -183,6 +185,9 @@ export interface TaskRecord {
   status: TaskStatus
   error: string | null
   createdAt: number
+  queuedAt?: number
+  startedAt?: number
+  queuePosition?: number
   finishedAt: number | null
   /** 总耗时毫秒 */
   elapsed: number | null
@@ -200,6 +205,14 @@ export interface TaskRecord {
   agentToolCallId?: string
   /** Agent 批量图像工具调用 ID */
   agentBatchCallId?: string
+  /** 图库批量任务分组 ID */
+  batchGroupId?: string
+  /** 图库批量任务类型 */
+  batchKind?: 'gallery-image-to-image'
+  /** 批量任务中的序号（从 0 开始） */
+  batchIndex?: number
+  /** 批量任务总数 */
+  batchSize?: number
   /** Agent 图像工具实际动作 */
   agentToolAction?: 'generate' | 'edit' | 'auto' | string
 }

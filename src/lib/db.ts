@@ -1,5 +1,5 @@
 import type { AgentConversation, StoredImage, StoredImageThumbnail, TaskRecord } from '../types'
-import { backendAgentConversations, backendImages, backendTasks, backendThumbnails } from './backendApi'
+import { backendAgentConversations, backendImages, backendTasks, backendThumbnails, type TaskListQuery, type TaskPage } from './backendApi'
 
 const THUMBNAIL_MAX_SIZE = 720
 const THUMBNAIL_QUALITY = 0.9
@@ -9,8 +9,31 @@ export const CURRENT_THUMBNAIL_VERSION = THUMBNAIL_VERSION
 
 // ===== Tasks =====
 
-export function getAllTasks(): Promise<TaskRecord[]> {
-  return backendTasks.list()
+export async function getAllTasks(): Promise<TaskRecord[]> {
+  const tasks: TaskRecord[] = []
+  let cursor: string | undefined
+  do {
+    const page = await backendTasks.list({ limit: 100, cursor })
+    tasks.push(...page.items)
+    cursor = page.nextCursor
+  } while (cursor)
+  return tasks
+}
+
+export function listTasks(query?: TaskListQuery): Promise<TaskPage> {
+  return backendTasks.list(query)
+}
+
+export function getTask(id: string): Promise<TaskRecord | null> {
+  return backendTasks.get(id)
+}
+
+export function getBatchTasks(batchGroupId: string): Promise<TaskRecord[]> {
+  return backendTasks.batch(batchGroupId)
+}
+
+export function getIncompleteTasks(): Promise<TaskRecord[]> {
+  return backendTasks.incomplete()
 }
 
 export async function putTask(task: TaskRecord): Promise<IDBValidKey> {

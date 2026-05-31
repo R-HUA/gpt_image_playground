@@ -31,6 +31,7 @@ export default function SearchBar() {
             onChange={(val) => setFilterStatus(val as any)}
             options={[
               { label: '全部状态', value: 'all' },
+              { label: '排队中', value: 'queued' },
               { label: '已完成', value: 'done' },
               { label: '生成中', value: 'running' },
               { label: '失败', value: 'error' },

@@ -23,6 +23,10 @@ import { remapImageMentionsForOrder, replaceImageMentionsForApi } from './lib/pr
 import {
   CURRENT_THUMBNAIL_VERSION,
   getAllTasks,
+  listTasks,
+  getTask,
+  getBatchTasks,
+  getIncompleteTasks,
   putTask as dbPutTask,
   deleteTask as dbDeleteTask,
   clearTasks as dbClearTasks,
@@ -40,7 +44,7 @@ import {
   clearImages,
   storeImage,
 } from './lib/db'
-import { fetchRemoteImageAsDataUrl, loadBackendSettings, redactSettingsForLocalStorage, saveBackendSettings, type AuthUser } from './lib/backendApi'
+import { backendGeneration, fetchRemoteImageAsDataUrl, loadBackendSettings, redactSettingsForLocalStorage, saveBackendSettings, type AuthUser, type GenerationRequest } from './lib/backendApi'
 import { callImageApi } from './lib/api'
 import { callAgentConversationTitleApi, callAgentResponsesApi, callBatchImageSingle, parseBatchImageCallArguments, type AgentApiResultImage, type BatchImageCallResult } from './lib/agentApi'
 import { collectAgentRoundOutputImageSlots, extractAgentReferenceIds, getAgentCurrentReferenceId, getAgentGeneratedImageReferenceId, replaceAgentPromptImageReferencesForApi } from './lib/agentImageReferences'
@@ -72,6 +76,8 @@ const AGENT_ROUND_IMAGE_MENTION_RE = /@(?:第)?(\d+)轮图(\d+)/g
 const falRecoveryTimers = new Map<string, ReturnType<typeof setTimeout>>()
 const customRecoveryTimers = new Map<string, ReturnType<typeof setTimeout>>()
 const openAIWatchdogTimers = new Map<string, ReturnType<typeof setTimeout>>()
+let taskPollingTimer: ReturnType<typeof setTimeout> | null = null
+let taskPollingInFlight = false
 const agentRoundControllers = new Map<string, AbortController>()
 let agentConversationPersistenceReady = false
 let agentConversationMigrationPending = false
@@ -769,6 +775,8 @@ interface AppState {
   // 参数
   params: TaskParams
   setParams: (p: Partial<TaskParams>) => void
+  batchImageToImage: boolean
+  setBatchImageToImage: (enabled: boolean) => void
   reusedTaskApiProfileId: string | null
   reusedTaskApiProfileName: string | null
   reusedTaskApiProfileMissing: boolean
@@ -801,6 +809,9 @@ interface AppState {
   // 任务列表
   tasks: TaskRecord[]
   setTasks: (t: TaskRecord[]) => void
+  taskNextCursor: string | null
+  tasksLoading: boolean
+  tasksLoadingMore: boolean
   streamPreviews: Record<string, string>
   streamPreviewSlots: Record<string, Record<string, string>>
   setTaskStreamPreview: (taskId: string, image?: string, requestIndex?: number) => void
@@ -808,7 +819,7 @@ interface AppState {
   // 搜索和筛选
   searchQuery: string
   setSearchQuery: (q: string) => void
-  filterStatus: 'all' | 'running' | 'done' | 'error'
+  filterStatus: 'all' | 'queued' | 'running' | 'done' | 'error'
   setFilterStatus: (status: AppState['filterStatus']) => void
   filterFavorite: boolean
   setFilterFavorite: (f: boolean) => void
@@ -1300,6 +1311,10 @@ export const useStore = create<AppState>()(
       // Params
       params: { ...DEFAULT_PARAMS },
       setParams: (p) => set((s) => ({ params: { ...s.params, ...p } })),
+      batchImageToImage: false,
+      setBatchImageToImage: (batchImageToImage) => set((state) => ({
+        batchImageToImage: batchImageToImage && state.appMode === 'gallery' && state.inputImages.length > 0 && !state.maskDraft,
+      })),
       reusedTaskApiProfileId: null,
       reusedTaskApiProfileName: null,
       reusedTaskApiProfileMissing: false,
@@ -1411,6 +1426,9 @@ export const useStore = create<AppState>()(
           ? { supportPromptSkippedForImportedData: false }
           : {}),
       })),
+      taskNextCursor: null,
+      tasksLoading: false,
+      tasksLoadingMore: false,
       streamPreviews: {},
       streamPreviewSlots: {},
       setTaskStreamPreview: (taskId, image, requestIndex = 0) => set((s) => {
@@ -1437,11 +1455,20 @@ export const useStore = create<AppState>()(
 
       // Search & Filter
       searchQuery: '',
-      setSearchQuery: (searchQuery) => set({ searchQuery }),
+      setSearchQuery: (searchQuery) => {
+        set({ searchQuery })
+        void reloadTasksFromServer()
+      },
       filterStatus: 'all',
-      setFilterStatus: (filterStatus) => set({ filterStatus }),
+      setFilterStatus: (filterStatus) => {
+        set({ filterStatus })
+        void reloadTasksFromServer()
+      },
       filterFavorite: false,
-      setFilterFavorite: (filterFavorite) => set({ filterFavorite }),
+      setFilterFavorite: (filterFavorite) => {
+        set({ filterFavorite })
+        void reloadTasksFromServer()
+      },
 
       // Selection
       selectedTaskIds: [],
@@ -1465,6 +1492,7 @@ export const useStore = create<AppState>()(
       setDetailTaskId: (detailTaskId) => {
         if (detailTaskId) dismissAllTooltips()
         set({ detailTaskId })
+        if (detailTaskId) void refreshTaskFromServer(detailTaskId)
       },
       lightboxImageId: null,
       lightboxImageList: [],
@@ -1560,6 +1588,9 @@ function clearRuntimeStateForUserSwitch() {
   customRecoveryTimers.clear()
   for (const timer of openAIWatchdogTimers.values()) clearTimeout(timer)
   openAIWatchdogTimers.clear()
+  if (taskPollingTimer) clearTimeout(taskPollingTimer)
+  taskPollingTimer = null
+  taskPollingInFlight = false
   for (const controller of agentRoundControllers.values()) controller.abort()
   agentRoundControllers.clear()
   if (backendSettingsSaveTimer) clearTimeout(backendSettingsSaveTimer)
@@ -1577,6 +1608,7 @@ function getUserSessionResetState(): Partial<AppState> {
     appMode: 'gallery',
     settings: { ...DEFAULT_SETTINGS },
     params: { ...DEFAULT_PARAMS },
+    batchImageToImage: false,
     dismissedCodexCliPrompts: [],
     prompt: '',
     inputImages: [],
@@ -1598,6 +1630,9 @@ function getUserSessionResetState(): Partial<AppState> {
     agentEditingConversationId: null,
     agentGeneratingTitleIds: {},
     tasks: [],
+    taskNextCursor: null,
+    tasksLoading: false,
+    tasksLoadingMore: false,
     streamPreviews: {},
     streamPreviewSlots: {},
     searchQuery: '',
@@ -1666,6 +1701,131 @@ function getPersistableTask(task: TaskRecord): TaskRecord {
 
 function putTask(task: TaskRecord): Promise<IDBValidKey> {
   return dbPutTask(getPersistableTask(task))
+}
+
+function mergeTasksById(current: TaskRecord[], incoming: TaskRecord[], mode: 'replace-page' | 'prepend' | 'append' = 'prepend') {
+  const map = new Map<string, TaskRecord>()
+  const seed = mode === 'replace-page' ? [] : current
+  for (const task of seed) map.set(task.id, task)
+  for (const task of incoming) map.set(task.id, task)
+  return [...map.values()].sort((a, b) => b.createdAt - a.createdAt)
+}
+
+function getTaskListQuery(cursor?: string | null) {
+  const state = useStore.getState()
+  return {
+    limit: 50,
+    ...(cursor ? { cursor } : {}),
+    q: state.searchQuery.trim() || undefined,
+    status: state.filterStatus,
+    favorite: state.filterFavorite,
+  }
+}
+
+function taskMatchesCurrentFilters(task: TaskRecord) {
+  const state = useStore.getState()
+  if (state.filterStatus !== 'all' && task.status !== state.filterStatus) return false
+  if (state.filterFavorite && !task.isFavorite) return false
+  const q = state.searchQuery.trim().toLowerCase()
+  if (q) {
+    const haystack = `${task.prompt || ''}\n${JSON.stringify(task.params ?? {})}`.toLowerCase()
+    if (!haystack.includes(q)) return false
+  }
+  return true
+}
+
+function reconcileTasksForCurrentFilters(current: TaskRecord[], incoming: TaskRecord[]) {
+  const incomingById = new Map(incoming.map((task) => [task.id, task]))
+  const next = current
+    .map((task) => incomingById.get(task.id) ?? task)
+    .filter((task) => taskMatchesCurrentFilters(task))
+  for (const task of incoming) {
+    if (taskMatchesCurrentFilters(task) && !next.some((item) => item.id === task.id)) next.push(task)
+  }
+  return next.sort((a, b) => b.createdAt - a.createdAt)
+}
+
+export async function reloadTasksFromServer() {
+  useStore.setState({ tasksLoading: true })
+  try {
+    const page = await listTasks(getTaskListQuery())
+    const tasks = reconcileTasksForCurrentFilters([], page.items)
+    useStore.getState().setTasks(tasks)
+    useStore.setState({ taskNextCursor: page.nextCursor ?? null })
+    scheduleTaskPollingIfNeeded()
+  } finally {
+    useStore.setState({ tasksLoading: false })
+  }
+}
+
+export async function loadMoreTasksFromServer() {
+  const state = useStore.getState()
+  if (!state.taskNextCursor || state.tasksLoadingMore) return
+  useStore.setState({ tasksLoadingMore: true })
+  try {
+    const page = await listTasks(getTaskListQuery(state.taskNextCursor))
+    useStore.setState((current) => ({
+      tasks: reconcileTasksForCurrentFilters(current.tasks, page.items),
+      taskNextCursor: page.nextCursor ?? null,
+    }))
+  } finally {
+    useStore.setState({ tasksLoadingMore: false })
+  }
+}
+
+async function refreshIncompleteTasks() {
+  if (taskPollingInFlight) return
+  taskPollingInFlight = true
+  try {
+    const incomplete = await getIncompleteTasks()
+    const ids = new Set(incomplete.map((task) => task.id))
+    const current = useStore.getState().tasks
+    const refreshDoneOrErrored = current.filter((task) =>
+      (task.status === 'queued' || task.status === 'running') && !ids.has(task.id),
+    )
+    const completed = await Promise.all(refreshDoneOrErrored.map((task) => getTask(task.id).catch(() => null)))
+    const incoming = [...incomplete, ...completed.filter((task): task is TaskRecord => Boolean(task))]
+    if (incoming.length) {
+      useStore.setState((state) => ({ tasks: reconcileTasksForCurrentFilters(state.tasks, incoming) }))
+    }
+  } finally {
+    taskPollingInFlight = false
+    scheduleTaskPollingIfNeeded()
+  }
+}
+
+export async function refreshTaskFromServer(taskId: string) {
+  const task = await getTask(taskId).catch(() => null)
+  if (!task) return
+  useStore.setState((state) => ({ tasks: reconcileTasksForCurrentFilters(state.tasks, [task]) }))
+  scheduleTaskPollingIfNeeded()
+}
+
+export async function loadBatchTasksFromServer(batchGroupId: string) {
+  const batchTasks = await getBatchTasks(batchGroupId)
+  useStore.setState((state) => ({ tasks: reconcileTasksForCurrentFilters(state.tasks, batchTasks) }))
+  return batchTasks
+}
+
+function scheduleTaskPollingIfNeeded() {
+  if (taskPollingTimer) {
+    clearTimeout(taskPollingTimer)
+    taskPollingTimer = null
+  }
+  const hasIncomplete = useStore.getState().tasks.some((task) => task.status === 'queued' || task.status === 'running')
+  if (!hasIncomplete) return
+  taskPollingTimer = setTimeout(() => {
+    taskPollingTimer = null
+    void refreshIncompleteTasks()
+  }, 2000)
+}
+
+async function enqueueGenerationTask(task: TaskRecord, request: GenerationRequest) {
+  const response = await backendGeneration.createTask(getPersistableTask(task), request)
+  const queuedTask = response.task
+  useStore.setState((state) => ({ tasks: mergeTasksById(state.tasks, [queuedTask]) }))
+  scheduleTaskPollingIfNeeded()
+  return queuedTask
 }
 
 export function getCodexCliPromptKey(settings: AppSettings): string {
@@ -2037,7 +2197,12 @@ export async function initStore(user?: AuthUser) {
   backendSettingsPersistenceReady = true
 
   const legacyAgentConversations = normalizeAgentConversations(useStore.getState().agentConversations)
-  const storedTasks = await getAllTasks()
+  const [taskPage, incompleteTasks] = await Promise.all([
+    listTasks({ limit: 50 }),
+    getIncompleteTasks(),
+  ])
+  const storedTasks = mergeTasksById(taskPage.items, incompleteTasks, 'prepend')
+  useStore.setState({ taskNextCursor: taskPage.nextCursor ?? null })
   const storedAgentConversations = normalizeAgentConversations(await getAllAgentConversations())
   let loadedAgentConversations = mergeAgentConversationsForStorage(storedAgentConversations, legacyAgentConversations)
   const currentAgentConversations = normalizeAgentConversations(useStore.getState().agentConversations)
@@ -2072,13 +2237,12 @@ export async function initStore(user?: AuthUser) {
   if (shouldRewritePersistedLocalState) {
     useStore.setState({})
   }
-  const { tasks: markedTasks, interruptedTasks } = markInterruptedOpenAIRunningTasks(storedTasks)
-  const interruptedTaskIds = new Set(interruptedTasks.map((task) => task.id))
-  const tasks = markedTasks.map(getPersistableTask)
+  const tasks = storedTasks.map(getPersistableTask)
   await Promise.all(tasks
-    .filter((task, index) => interruptedTaskIds.has(task.id) || task.rawResponsePayload !== markedTasks[index]?.rawResponsePayload)
+    .filter((task, index) => task.rawResponsePayload !== storedTasks[index]?.rawResponsePayload)
     .map((task) => putTask(task)))
   useStore.getState().setTasks(tasks)
+  scheduleTaskPollingIfNeeded()
   showSupportPromptForExistingLocalData(tasks)
   for (const task of tasks) {
     if (
@@ -2234,6 +2398,7 @@ export async function initStore(user?: AuthUser) {
 export async function submitTask(options: { allowFullMask?: boolean; useCurrentApiProfileWhenReusedMissing?: boolean } = {}) {
   const { settings, prompt, inputImages, maskDraft, params, reusedTaskApiProfileId, reusedTaskApiProfileName, reusedTaskApiProfileMissing, showToast, setConfirmDialog } =
     useStore.getState()
+  const batchImageToImage = useStore.getState().batchImageToImage && inputImages.length > 0 && !maskDraft
 
   const normalizedSettings = normalizeSettings(settings)
   let activeProfile = getActiveApiProfile(settings)
@@ -2315,40 +2480,62 @@ export async function submitTask(options: { allowFullMask?: boolean; useCurrentA
     useStore.getState().setParams(normalizedParamPatch)
   }
 
-  const taskId = genId()
-  const task: TaskRecord = {
-    id: taskId,
+  const createBaseTask = (inputIds: string[], taskParams: TaskParams, batch?: { groupId: string; index: number; size: number }): TaskRecord => ({
+    id: genId(),
     prompt: prompt.trim(),
-    params: normalizedParams,
+    params: taskParams,
     apiProvider: activeProfile.provider,
     apiProfileId: activeProfile.id,
     apiProfileName: activeProfile.name,
     apiMode: activeProfile.apiMode,
     apiModel: activeProfile.model,
-    inputImageIds: orderedInputImages.map((i) => i.id),
+    inputImageIds: inputIds,
     maskTargetImageId,
     maskImageId,
     outputImages: [],
-    status: 'running',
+    status: 'queued',
     error: null,
     createdAt: Date.now(),
+    queuedAt: Date.now(),
     finishedAt: null,
     elapsed: null,
-  }
+    ...(batch ? { batchGroupId: batch.groupId, batchKind: 'gallery-image-to-image' as const, batchIndex: batch.index, batchSize: batch.size } : {}),
+  })
 
-  const latestTasks = useStore.getState().tasks
-  useStore.getState().setTasks([task, ...latestTasks])
-  await putTask(task)
-  useStore.getState().showToast('任务已提交', 'success')
+  if (batchImageToImage) {
+    const batchGroupId = genId()
+    const batchTasks = orderedInputImages.map((image, index) => createBaseTask([image.id], { ...normalizedParams, n: 1 }, {
+      groupId: batchGroupId,
+      index,
+      size: orderedInputImages.length,
+    }))
+    await Promise.all(batchTasks.map((task) => enqueueGenerationTask(task, {
+        profile: activeProfile,
+        settings: requestSettings,
+        prompt: replaceImageMentionsForApi(task.prompt, 1),
+        params: task.params,
+        inputImageIds: task.inputImageIds,
+        maskImageId: null,
+      })))
+    useStore.getState().showToast(`已提交批量图生图：${batchTasks.length} 个任务已进入队列`, 'success')
+  } else {
+    const task = createBaseTask(orderedInputImages.map((i) => i.id), normalizedParams)
+    await enqueueGenerationTask(task, {
+      profile: activeProfile,
+      settings: requestSettings,
+      prompt: replaceImageMentionsForApi(task.prompt, orderedInputImages.length),
+      params: task.params,
+      inputImageIds: task.inputImageIds,
+      maskImageId: task.maskImageId,
+    })
+    useStore.getState().showToast('任务已提交队列', 'success')
+  }
 
   if (settings.clearInputAfterSubmit) {
     useStore.getState().setPrompt('')
     useStore.getState().clearInputImages()
   }
   useStore.getState().setReusedTaskApiProfile(null)
-
-  // 异步调用 API
-  executeTask(taskId)
 }
 
 function getActiveAgentConversation(): AgentConversation {
@@ -3390,9 +3577,10 @@ async function executeAgentRound(
         maskTargetImageId: options.maskTargetImageId !== undefined ? options.maskTargetImageId : round.maskTargetImageId ?? null,
         maskImageId: options.maskImageId !== undefined ? options.maskImageId : round.maskImageId ?? null,
         outputImages: [],
-        status: 'running',
+        status: 'queued',
         error: null,
         createdAt: options.createdAt ?? Date.now(),
+        queuedAt: Date.now(),
         finishedAt: null,
         elapsed: null,
         sourceMode: 'agent',
@@ -3406,7 +3594,6 @@ async function executeAgentRound(
       taskIdByToolCallId.set(toolCallId, task.id)
       useStore.getState().setTasks([task, ...useStore.getState().tasks])
       attachTaskToAgentRound(task.id)
-      await putTask(task)
       return task.id
     }
 
@@ -3534,45 +3721,32 @@ async function executeAgentRound(
       // Fire all batch items concurrently after all cards are visible.
       const batchPromises = batchExecutionItems.map(async ({ item, batchToolCallId, references, referenceIds }) => {
 
-        const batchResult = await callBatchImageSingle({
-          profile: activeProfile,
-          params,
-          batchItemId: item.id,
-          prompt: item.prompt,
-          referenceImageDataUrls: references.dataUrls,
-          referenceIds,
-          signal: controller.signal,
-          onImageToolStarted: shouldStreamAssistantMessage
-            ? async () => {
-                if (controller.signal.aborted) return
-              }
-            : undefined,
-          onPartialImage: shouldStreamAssistantMessage
-            ? async ({ image, partialImageIndex }) => {
-                if (controller.signal.aborted) return
-                const taskId = taskIdByToolCallId.get(batchToolCallId)
-                if (taskId) {
-                  useStore.getState().setTaskStreamPreview(taskId, image, partialImageIndex)
-                  if (partialImageIndex === 0 || partialImageIndex == null) {
-                    void persistTaskStreamPartialImage(taskId, image)
-                  }
-                }
-              }
-            : undefined,
-          onImageToolCompleted: shouldStreamAssistantMessage
-            ? async (image) => {
-                if (controller.signal.aborted) return
-                await completeAgentImageTask({ ...image, toolCallId: batchToolCallId })
-              }
-            : undefined,
-        })
-
-        // If not streaming and we have an image, complete the pre-created task.
-        if (batchResult.image && !shouldStreamAssistantMessage) {
-          await completeAgentImageTask({ ...batchResult.image, toolCallId: batchToolCallId }, batchResult.rawResponsePayload)
+        const taskId = taskIdByToolCallId.get(batchToolCallId)
+        const task = taskId ? useStore.getState().tasks.find((item) => item.id === taskId) : null
+        if (!task) {
+          return { batchItemId: item.id, image: null, error: 'Task card was not created' } satisfies BatchImageCallResult
         }
-
-        return batchResult
+        try {
+          await enqueueGenerationTask(task, {
+            profile: activeProfile,
+            settings: requestSettings,
+            prompt: item.prompt,
+            params: { ...params, n: 1 },
+            inputImageIds: references.imageIds,
+            maskImageId: null,
+            referenceIds,
+            agentBatchItemId: item.id,
+          })
+          return { batchItemId: item.id, image: { dataUrl: '' }, error: null } satisfies BatchImageCallResult
+        } catch (err) {
+          updateTaskInStore(task.id, {
+            status: 'error',
+            error: err instanceof Error ? err.message : String(err),
+            finishedAt: Date.now(),
+            elapsed: 0,
+          })
+          return { batchItemId: item.id, image: null, error: err instanceof Error ? err.message : String(err) } satisfies BatchImageCallResult
+        }
       })
 
       const batchResults = await Promise.allSettled(batchPromises)
@@ -3586,7 +3760,7 @@ async function executeAgentRound(
           const r = settled.value
           outputImages.push({
             id: r.batchItemId,
-            status: r.image ? 'done' : 'error',
+            status: r.error ? 'error' : 'queued',
             ...(r.error ? { error: r.error } : {}),
           })
         } else {
@@ -3598,7 +3772,7 @@ async function executeAgentRound(
         }
       }
 
-      const successCount = outputImages.filter((img) => img.status === 'done').length
+      const successCount = outputImages.filter((img) => img.status !== 'error').length
       toolCallsUsed += successCount
 
       return JSON.stringify({ images: outputImages })
@@ -3752,7 +3926,7 @@ async function executeAgentRound(
         (item) => item.type === 'function_call' && item.name === 'continue_generation',
       )
 
-      // Count built-in tool calls (image_generation, web_search) for budget tracking
+      // Count built-in tool calls (web_search/image_generation if a compatible provider still emits it) for budget tracking.
       const responseToolCalls = countResponseToolCalls(currentResponseOutputItems)
       toolCallsUsed += responseToolCalls
 
@@ -3816,22 +3990,22 @@ async function executeAgentRound(
       )
       // Insert function_call_output items before the continuation system message
       continuationBase.splice(continuationBase.length - 1, 0, ...functionCallOutputs)
-      // Inject batch-generated images as input_image user message for model visibility
-      const batchImagesItem = await createAgentBatchImagesInputItem(latestRound, useStore.getState().tasks, streamingTaskIds)
-      if (batchImagesItem) continuationBase.splice(continuationBase.length - 1, 0, batchImagesItem)
+      // Backend queued images may not be finished yet; later turns will inject completed outputs.
       apiInputForTurn = continuationBase
       accumulatedOutputItems = accumulatedOutputItemsWithFunctionOutputs
       pendingToolTextSeparator = true
     }
 
     const taskIds: string[] = [...streamingTaskIds]
-    const outputIds = taskIds.flatMap((taskId) => useStore.getState().tasks.find((task) => task.id === taskId)?.outputImages ?? [])
+    const latestRoundTasks = taskIds.map((taskId) => useStore.getState().tasks.find((task) => task.id === taskId)).filter((task): task is TaskRecord => Boolean(task))
+    const outputIds = latestRoundTasks.flatMap((task) => task.outputImages ?? [])
+    const queuedCount = latestRoundTasks.filter((task) => task.status === 'queued' || task.status === 'running').length
     const limitNotice = reachedToolLimit ? `已达到最大工具调用次数（${maxToolCalls}），已停止自动续跑。` : ''
     const joinedText = textSegments.join('\n\n').trim()
     const finalContent = [joinedText, limitNotice]
       .filter(Boolean)
       .join(joinedText ? '\n\n' : '')
-      || (taskIds.length > 0 || outputIds.length > 0 ? '图像已生成。' : '')
+      || (queuedCount > 0 ? `${queuedCount} 个图像任务已进入队列。` : taskIds.length > 0 || outputIds.length > 0 ? '图像已生成。' : '')
 
     const assistantMessage: AgentMessage = {
       id: assistantMessageId,
@@ -3864,7 +4038,7 @@ async function executeAgentRound(
         : [...current.messages, assistantMessage],
     }))
 
-    useStore.getState().showToast(outputIds.length > 0 ? 'Agent 已生成图片' : 'Agent 已回复', 'success')
+    useStore.getState().showToast(queuedCount > 0 ? `Agent 已提交 ${queuedCount} 个图像任务` : outputIds.length > 0 ? 'Agent 已生成图片' : 'Agent 已回复', 'success')
   } catch (err) {
     if (controller.signal.aborted) {
       if (markAgentRoundStopped(conversationId, roundId)) {
@@ -4146,6 +4320,7 @@ export function updateTaskInStore(taskId: string, patch: Partial<TaskRecord>) {
   maybeOpenSupportPrompt(tasks, updated, taskId)
   const task = updated.find((t) => t.id === taskId)
   if (task) putTask(task)
+  scheduleTaskPollingIfNeeded()
 }
 
 /** 重试失败的任务：创建新任务并执行 */
@@ -4167,18 +4342,24 @@ export async function retryTask(task: TaskRecord) {
     maskTargetImageId: task.maskTargetImageId ?? null,
     maskImageId: task.maskImageId ?? null,
     outputImages: [],
-    status: 'running',
+    status: 'queued',
     error: null,
     createdAt: Date.now(),
+    queuedAt: Date.now(),
     finishedAt: null,
     elapsed: null,
   }
 
-  const latestTasks = useStore.getState().tasks
-  useStore.getState().setTasks([newTask, ...latestTasks])
-  await putTask(newTask)
-
-  executeTask(taskId)
+  const profile = getTaskApiProfile(settings, newTask) ?? activeProfile
+  const requestSettings = createSettingsForApiProfile(settings, profile)
+  await enqueueGenerationTask(newTask, {
+    profile,
+    settings: requestSettings,
+    prompt: replaceImageMentionsForApi(newTask.prompt, newTask.inputImageIds.length),
+    params: newTask.params,
+    inputImageIds: newTask.inputImageIds,
+    maskImageId: newTask.maskImageId,
+  })
 }
 
 /** 复用配置 */

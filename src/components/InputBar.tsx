@@ -395,6 +395,8 @@ export default function InputBar() {
   const clearInputImages = useStore((s) => s.clearInputImages)
   const params = useStore((s) => s.params)
   const setParams = useStore((s) => s.setParams)
+  const batchImageToImage = useStore((s) => s.batchImageToImage)
+  const setBatchImageToImage = useStore((s) => s.setBatchImageToImage)
   const settings = useStore((s) => s.settings)
   const setSettings = useStore((s) => s.setSettings)
   const reusedTaskApiProfileId = useStore((s) => s.reusedTaskApiProfileId)
@@ -408,33 +410,16 @@ export default function InputBar() {
   const tasks = useStore((s) => s.tasks)
   const agentConversations = useStore((s) => s.agentConversations)
   const activeAgentConversationId = useStore((s) => s.activeAgentConversationId)
-  const filterStatus = useStore((s) => s.filterStatus)
-  const filterFavorite = useStore((s) => s.filterFavorite)
-  const searchQuery = useStore((s) => s.searchQuery)
-
-  const filteredTasks = useMemo(() => {
-    const sorted = [...tasks].sort((a, b) => b.createdAt - a.createdAt)
-    const q = searchQuery.trim().toLowerCase()
-    
-    return sorted.filter((t) => {
-      if (filterFavorite && !t.isFavorite) return false
-      const matchStatus = filterStatus === 'all' || t.status === filterStatus
-      if (!matchStatus) return false
-      
-      if (!q) return true
-      const prompt = (t.prompt || '').toLowerCase()
-      const paramStr = JSON.stringify(t.params).toLowerCase()
-      return prompt.includes(q) || paramStr.includes(q)
-    })
-  }, [tasks, searchQuery, filterStatus, filterFavorite])
+  const visibleTaskIds = new Set(tasks.map((task) => task.id))
+  const visibleSelectedIds = selectedTaskIds.filter((id) => visibleTaskIds.has(id))
 
   const handleSelectAllToggle = useCallback(() => {
-    if (selectedTaskIds.length === filteredTasks.length && filteredTasks.length > 0) {
+    if (visibleSelectedIds.length === tasks.length && tasks.length > 0) {
       clearSelection()
     } else {
-      setSelectedTaskIds(filteredTasks.map((t) => t.id))
+      setSelectedTaskIds(tasks.map((t) => t.id))
     }
-  }, [selectedTaskIds.length, filteredTasks, clearSelection, setSelectedTaskIds])
+  }, [visibleSelectedIds.length, tasks, clearSelection, setSelectedTaskIds])
 
   const handleToggleFavorite = useCallback(() => {
     const selectedTasks = tasks.filter((t) => selectedTaskIds.includes(t.id))
@@ -590,6 +575,8 @@ export default function InputBar() {
       : normalizeSettings({ ...settings, activeProfileId: activeProfile.id })
   ), [activeProfile.id, currentActiveProfile.id, settings])
   const hasSubmitApiConfig = Boolean(activeProfile.apiKey)
+  const batchImageToImageAvailable = appMode === 'gallery' && inputImages.length > 0 && !maskDraft
+  const effectiveBatchImageToImage = batchImageToImage && batchImageToImageAvailable
   const canSubmit = Boolean(prompt.trim() && hasSubmitApiConfig && !activeAgentIsRunning)
   const submitButtonAriaLabel = activeAgentIsRunning
     ? '停止生成'
@@ -626,7 +613,7 @@ export default function InputBar() {
   const isFalTextToImage = isFalProvider && inputImages.length === 0
   const nDraftValue = Number(nInput)
   const effectiveNValue = Number.isNaN(nDraftValue) ? params.n : nDraftValue
-  const streamConcurrentByN = activeProfile.provider === 'openai' && activeProfile.streamImages === true && !agentAutoImageCount && effectiveNValue > 1
+  const streamConcurrentByN = activeProfile.provider === 'openai' && activeProfile.streamImages === true && !agentAutoImageCount && !effectiveBatchImageToImage && effectiveNValue > 1
   const nLimitHintText = agentAutoImageCount
     ? 'Agent 模式下数量由模型根据提示词自动决定'
     : isFalProvider
@@ -790,6 +777,10 @@ export default function InputBar() {
       setParams(patch)
     }
   }, [inputImages.length, params, effectiveSettings, setParams])
+
+  useEffect(() => {
+    if (batchImageToImage && !batchImageToImageAvailable) setBatchImageToImage(false)
+  }, [batchImageToImage, batchImageToImageAvailable, setBatchImageToImage])
 
   useEffect(() => () => {
     if (imageHintTimerRef.current != null) {
@@ -1860,50 +1851,80 @@ export default function InputBar() {
           text="fal.ai 不支持审核参数"
         />
       </label>
-      <label
-        className="relative flex flex-col gap-0.5"
-        onMouseEnter={showAgentNHint}
-        onMouseLeave={hideNLimitHint}
-        onTouchStart={startAgentNHintTouch}
-        onTouchEnd={clearAgentNHintTouchTimer}
-        onTouchCancel={() => {
-          clearAgentNHintTouchTimer()
-          hideNLimitHint()
-        }}
-        onClick={showAgentNHint}
-      >
-        <span className="text-gray-400 dark:text-gray-500 ml-1">数量</span>
-        <input
-          value={nInput}
-          onChange={(e) => handleNInputChange(e.target.value)}
-          onFocus={() => setNInputFocused(true)}
-          onBlur={() => {
-            setNInputFocused(false)
-            commitN()
+      {appMode === 'gallery' && inputImages.length > 0 && (
+        <label className="flex flex-col gap-0.5">
+          <span className="text-gray-400 dark:text-gray-500 ml-1">批量</span>
+          <button
+            type="button"
+            disabled={Boolean(maskDraft)}
+            onClick={() => setBatchImageToImage(!effectiveBatchImageToImage)}
+            className={`px-3 py-1.5 rounded-xl border text-xs transition-all duration-200 shadow-sm ${
+              effectiveBatchImageToImage
+                ? 'border-blue-400 bg-blue-50 text-blue-600 dark:bg-blue-500/10 dark:text-blue-300'
+                : maskDraft
+                ? 'border-gray-200/60 bg-gray-100/50 text-gray-400 opacity-60 cursor-not-allowed dark:border-white/[0.08] dark:bg-white/[0.05]'
+                : 'border-gray-200/60 bg-white/50 text-gray-600 hover:bg-gray-50 dark:border-white/[0.08] dark:bg-white/[0.03] dark:text-gray-300'
+            }`}
+            title={maskDraft ? '批量图生图暂不支持蒙版，请清除蒙版后使用' : '每张参考图各生成 1 张'}
+          >
+            {effectiveBatchImageToImage ? '已开启' : '关闭'}
+          </button>
+        </label>
+      )}
+      {effectiveBatchImageToImage ? (
+        <div className="flex min-w-[12rem] flex-col gap-0.5">
+          <span className="text-gray-400 dark:text-gray-500 ml-1">批量数量</span>
+          <div className="rounded-xl border border-blue-200 bg-blue-50 px-3 py-1.5 text-xs text-blue-700 shadow-sm dark:border-blue-500/20 dark:bg-blue-500/10 dark:text-blue-300">
+            {inputImages.length} 张参考图，各生成 1 张，共 {inputImages.length} 张
+          </div>
+          <span className="ml-1 text-[11px] text-gray-400">数量由参考图数量决定，不可手动修改</span>
+        </div>
+      ) : (
+        <label
+          className="relative flex flex-col gap-0.5"
+          onMouseEnter={showAgentNHint}
+          onMouseLeave={hideNLimitHint}
+          onTouchStart={startAgentNHintTouch}
+          onTouchEnd={clearAgentNHintTouchTimer}
+          onTouchCancel={() => {
+            clearAgentNHintTouchTimer()
+            hideNLimitHint()
           }}
-          onKeyDown={(e) => {
-            if (e.key === 'ArrowUp') {
-              handleNLimitIncreaseAttempt(() => e.preventDefault())
-            }
-          }}
-          onWheel={(e) => {
-            if (e.deltaY < 0) {
-              handleNLimitIncreaseAttempt(() => e.preventDefault())
-            }
-          }}
-          disabled={agentAutoImageCount}
-          type={agentAutoImageCount ? 'text' : 'number'}
-          min={agentAutoImageCount ? undefined : 1}
-          max={agentAutoImageCount ? undefined : outputImageLimit}
-          className={`px-3 py-1.5 rounded-xl border border-gray-200/60 dark:border-white/[0.08] focus:outline-none text-xs transition-all duration-200 shadow-sm ${
-            agentAutoImageCount
-              ? 'bg-gray-100/50 dark:bg-white/[0.05] opacity-50 cursor-not-allowed'
-              : 'bg-white/50 dark:bg-white/[0.03]'
-          }`}
-        />
-        <ButtonTooltip visible={nLimitHint.visible} text={nLimitHintText} />
-        <ButtonTooltip visible={streamConcurrentByN && !nLimitHint.visible} text="数量大于 1 时会将多图生成拆分为并发单图" />
-      </label>
+          onClick={showAgentNHint}
+        >
+          <span className="text-gray-400 dark:text-gray-500 ml-1">数量</span>
+          <input
+            value={nInput}
+            onChange={(e) => handleNInputChange(e.target.value)}
+            onFocus={() => setNInputFocused(true)}
+            onBlur={() => {
+              setNInputFocused(false)
+              commitN()
+            }}
+            onKeyDown={(e) => {
+              if (e.key === 'ArrowUp') {
+                handleNLimitIncreaseAttempt(() => e.preventDefault())
+              }
+            }}
+            onWheel={(e) => {
+              if (e.deltaY < 0) {
+                handleNLimitIncreaseAttempt(() => e.preventDefault())
+              }
+            }}
+            disabled={agentAutoImageCount}
+            type={agentAutoImageCount ? 'text' : 'number'}
+            min={agentAutoImageCount ? undefined : 1}
+            max={agentAutoImageCount ? undefined : outputImageLimit}
+            className={`px-3 py-1.5 rounded-xl border border-gray-200/60 dark:border-white/[0.08] focus:outline-none text-xs transition-all duration-200 shadow-sm ${
+              agentAutoImageCount
+                ? 'bg-gray-100/50 dark:bg-white/[0.05] opacity-50 cursor-not-allowed'
+                : 'bg-white/50 dark:bg-white/[0.03]'
+            }`}
+          />
+          <ButtonTooltip visible={nLimitHint.visible} text={nLimitHintText} />
+          <ButtonTooltip visible={streamConcurrentByN && !nLimitHint.visible} text="数量大于 1 时会将多图生成拆分为并发单图" />
+        </label>
+      )}
     </div>
   )
 
@@ -1969,9 +1990,9 @@ export default function InputBar() {
               <button
                 onClick={handleSelectAllToggle}
                 className="p-2 text-blue-500 dark:text-blue-400 hover:text-blue-600 dark:hover:text-blue-300 transition-colors"
-                title={selectedTaskIds.length === filteredTasks.length && filteredTasks.length > 0 ? "取消全选" : "全选当前可见"}
+                title={visibleSelectedIds.length === tasks.length && tasks.length > 0 ? "取消全选" : "全选当前可见"}
               >
-                {selectedTaskIds.length === filteredTasks.length && filteredTasks.length > 0 ? (
+                {visibleSelectedIds.length === tasks.length && tasks.length > 0 ? (
                   <svg className="w-5 h-5" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" viewBox="0 0 24 24">
                     <rect x="3" y="3" width="18" height="18" rx="2" ry="2" />
                     <path d="M9 12l2 2 4-4" />

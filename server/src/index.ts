@@ -14,17 +14,68 @@ const DEFAULT_FAL_BASE_URL = 'https://fal.run'
 const ACCESS_TOKEN_TTL_MS = 15 * 60 * 1000
 const REFRESH_TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000
 const DEFAULT_FAL_IMAGE_SIZE = { width: 1360, height: 1024 }
+const GENERATION_CONCURRENCY = Math.max(1, Number.parseInt(process.env.GIP_GENERATION_CONCURRENCY || '1', 10) || 1)
+const CUSTOM_POLL_TIMEOUT_SECONDS = Math.max(1, Number.parseInt(process.env.GIP_CUSTOM_POLL_TIMEOUT_SECONDS || '900', 10) || 900)
+const PROMPT_REWRITE_GUARD_PREFIX = 'Use the following text as the complete prompt. Do not rewrite it:'
 
 type JsonRecord = Record<string, unknown>
 type AuthUser = { id: number; username: string }
 type DbRow = Record<string, unknown>
 type ApiProfile = {
   id?: string
+  name?: string
   provider?: string
   baseUrl?: string
   apiKey?: string
   model?: string
   timeout?: number
+  apiMode?: 'images' | 'responses'
+  codexCli?: boolean
+  responseFormatB64Json?: boolean
+  streamImages?: boolean
+  streamPartialImages?: number
+}
+type CustomProviderRequestMethod = 'GET' | 'POST'
+type CustomProviderContentType = 'json' | 'multipart'
+type CustomProviderFileSource = 'inputImages' | 'mask'
+type CustomProviderFileMapping = {
+  field: string
+  source: CustomProviderFileSource
+  array?: boolean
+}
+type CustomProviderResultMapping = {
+  imageUrlPaths?: string[]
+  b64JsonPaths?: string[]
+}
+type CustomProviderSubmitMapping = {
+  path: string
+  method?: CustomProviderRequestMethod
+  contentType?: CustomProviderContentType
+  query?: Record<string, string>
+  body?: Record<string, unknown>
+  files?: CustomProviderFileMapping[]
+  taskIdPath?: string
+  result?: CustomProviderResultMapping
+}
+type CustomProviderPollMapping = {
+  path: string
+  method?: CustomProviderRequestMethod
+  query?: Record<string, string>
+  intervalSeconds?: number
+  timeoutSeconds?: number
+  maxAttempts?: number
+  statusPath: string
+  successValues: string[]
+  failureValues: string[]
+  errorPath?: string
+  result: CustomProviderResultMapping
+}
+type CustomProviderDefinition = {
+  id: string
+  name: string
+  submit: CustomProviderSubmitMapping
+  editSubmit?: CustomProviderSubmitMapping
+  poll?: CustomProviderPollMapping
 }
 type TaskParams = {
   size: string
@@ -40,6 +91,55 @@ type CallApiResult = {
   actualParamsList?: Array<Partial<TaskParams> | undefined>
   revisedPrompts?: Array<string | undefined>
   rawImageUrls?: string[]
+  rawResponsePayload?: string
+}
+type TaskStatus = 'queued' | 'running' | 'done' | 'error'
+type TaskRecord = JsonRecord & {
+  id: string
+  prompt: string
+  params: TaskParams
+  inputImageIds: string[]
+  maskImageId?: string | null
+  outputImages: string[]
+  status: TaskStatus
+  error: string | null
+  createdAt: number
+  queuedAt?: number
+  startedAt?: number
+  queuePosition?: number
+  finishedAt: number | null
+  elapsed: number | null
+  actualParams?: Partial<TaskParams>
+  actualParamsByImage?: Record<string, Partial<TaskParams>>
+  revisedPromptByImage?: Record<string, string>
+  rawImageUrls?: string[]
+  rawResponsePayload?: string
+}
+type GenerationJobStatus = 'queued' | 'running' | 'done' | 'error'
+type GenerationRequest = {
+  profile: ApiProfile
+  settings?: JsonRecord
+  prompt?: string
+  params?: TaskParams
+  inputImageIds?: string[]
+  maskImageId?: string | null
+  referenceIds?: string[]
+  agentBatchItemId?: string
+}
+type GenerationJobRow = {
+  id: string
+  user_id: number
+  task_id: string
+  status: GenerationJobStatus
+  queued_at: number
+  started_at?: number | null
+  finished_at?: number | null
+  request_json: string
+  error?: string | null
+}
+type ActiveGenerationJob = {
+  controller: AbortController
+  cancelled: boolean
 }
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
@@ -116,6 +216,21 @@ function initDb() {
       PRIMARY KEY (user_id, id)
     );
 
+    CREATE TABLE IF NOT EXISTS generation_jobs (
+      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      id TEXT NOT NULL,
+      task_id TEXT NOT NULL,
+      status TEXT NOT NULL,
+      queued_at INTEGER NOT NULL,
+      started_at INTEGER,
+      finished_at INTEGER,
+      request_json TEXT NOT NULL,
+      error TEXT,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      PRIMARY KEY (user_id, id)
+    );
+
     CREATE TABLE IF NOT EXISTS agent_conversations (
       user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
       id TEXT NOT NULL,
@@ -146,7 +261,36 @@ function initDb() {
       updated_at INTEGER NOT NULL,
       PRIMARY KEY (user_id, id)
     );
+
+    CREATE INDEX IF NOT EXISTS idx_generation_jobs_dispatch
+      ON generation_jobs (status, queued_at, created_at);
+    CREATE INDEX IF NOT EXISTS idx_generation_jobs_task
+      ON generation_jobs (user_id, task_id);
   `)
+
+  const resetStamp = now()
+  db.prepare(`
+    UPDATE generation_jobs
+    SET status = 'queued', started_at = NULL, error = NULL, updated_at = ?
+    WHERE status = 'running'
+  `).run(resetStamp)
+  const resetTasks = db.prepare(`
+    SELECT tasks.user_id, tasks.id, tasks.json
+    FROM tasks
+    WHERE EXISTS (
+      SELECT 1
+      FROM generation_jobs
+      WHERE generation_jobs.user_id = tasks.user_id
+        AND generation_jobs.task_id = tasks.id
+        AND generation_jobs.status = 'queued'
+    )
+  `).all()
+  const updateTask = db.prepare('UPDATE tasks SET json = ?, updated_at = ? WHERE user_id = ? AND id = ?')
+  for (const row of resetTasks) {
+    const task = parseJson<JsonRecord>(String(row.json), {})
+    if (task.status !== 'running') continue
+    updateTask.run(JSON.stringify({ ...task, status: 'queued', startedAt: undefined, error: null }), resetStamp, row.user_id, row.id)
+  }
 }
 
 function getServerSecret() {
@@ -333,6 +477,11 @@ function tableJsonRows(table: string, userId: number, orderBy: string) {
     .filter((value) => value != null)
 }
 
+function getJsonRow<T = unknown>(table: string, userId: number, id: string): T | null {
+  const row = db.prepare(`SELECT json FROM ${table} WHERE user_id = ? AND id = ?`).get(userId, id)
+  return row ? parseJson<T>(String(row.json), null as T) : null
+}
+
 function putJsonRow(table: string, userId: number, id: string, value: unknown, createdAt?: number, updatedAt?: number) {
   const stamp = now()
   db.prepare(`
@@ -491,6 +640,33 @@ function getStoredFile(kind: 'images' | 'thumbnails', userId: number, id: string
   return row ? rowToDataUrl(row, field) : null
 }
 
+async function readTaskImageDataUrl(userId: number, id: string) {
+  const image = getStoredFile('images', userId, id)
+  const dataUrl = isRecord(image) ? asString(image.dataUrl) : ''
+  if (!dataUrl) throw Object.assign(new Error('输入图片已不存在'), { statusCode: 400 })
+  return dataUrl
+}
+
+async function readTaskImageDataUrls(userId: number, ids: string[]) {
+  const dataUrls: string[] = []
+  for (const id of ids) dataUrls.push(await readTaskImageDataUrl(userId, id))
+  return dataUrls
+}
+
+async function storeGeneratedImage(userId: number, dataUrl: string) {
+  const id = createHash('sha256').update(dataUrl).digest('hex')
+  const existing = getStoredFile('images', userId, id)
+  if (!existing) {
+    await putStoredFile('images', userId, id, {
+      id,
+      dataUrl,
+      createdAt: now(),
+      source: 'generated',
+    }, 'dataUrl')
+  }
+  return id
+}
+
 function getStoredFileMetadata(kind: 'images' | 'thumbnails', userId: number, id: string) {
   const table = kind === 'images' ? 'images' : 'thumbnails'
   const row = db.prepare(`SELECT metadata_json FROM ${table} WHERE user_id = ? AND id = ?`).get(userId, id)
@@ -539,6 +715,13 @@ function resolveProfileForUser(userId: number, input: unknown): ApiProfile {
     ...profile,
     apiKey: asString(stored?.apiKey) || asString(settings?.apiKey),
   }
+}
+
+function getCustomProviderDefinition(settings: unknown, provider: string | undefined): CustomProviderDefinition | null {
+  if (!provider || provider === 'openai' || provider === 'fal' || !isRecord(settings)) return null
+  const providers = Array.isArray(settings.customProviders) ? settings.customProviders.filter(isRecord) : []
+  const found = providers.find((item) => asString(item.id) === provider)
+  return found ? found as CustomProviderDefinition : null
 }
 
 function buildProviderUrl(profile: ApiProfile, path: string) {
@@ -698,6 +881,420 @@ function writeNdjson(res: ServerResponse, event: unknown) {
   res.write(`${JSON.stringify(event)}\n`)
 }
 
+function taskParams(value: unknown): TaskParams {
+  const record = isRecord(value) ? value : {}
+  return {
+    size: asString(record.size, 'auto'),
+    quality: record.quality === 'low' || record.quality === 'medium' || record.quality === 'high' ? record.quality : 'auto',
+    output_format: record.output_format === 'jpeg' || record.output_format === 'webp' ? record.output_format : 'png',
+    output_compression: typeof record.output_compression === 'number' ? record.output_compression : null,
+    moderation: record.moderation === 'low' ? 'low' : 'auto',
+    n: Math.max(1, Math.trunc(asNumber(record.n, 1))),
+  }
+}
+
+function mimeForParams(params: TaskParams) {
+  return params.output_format === 'jpeg' ? 'image/jpeg' : `image/${params.output_format || 'png'}`
+}
+
+function normalizeBase64DataUrl(value: string, fallbackMime: string) {
+  return value.startsWith('data:') ? value : `data:${fallbackMime};base64,${value}`
+}
+
+function getByPath(source: unknown, path: string | undefined): unknown {
+  if (!path) return source
+  return path.split('.').filter(Boolean).reduce<unknown>((current, key) => {
+    if (current == null) return undefined
+    if (/^\d+$/.test(key) && Array.isArray(current)) return current[Number(key)]
+    if (typeof current === 'object') return (current as Record<string, unknown>)[key]
+    return undefined
+  }, source)
+}
+
+function getAllByPath(source: unknown, path: string | undefined): unknown[] {
+  if (!path) return [source]
+  const parts = path.split('.').filter(Boolean)
+  let current: unknown[] = [source]
+
+  for (const key of parts) {
+    const next: unknown[] = []
+    for (const item of current) {
+      if (item == null) continue
+      if (key === '*') {
+        if (Array.isArray(item)) next.push(...item)
+        else if (typeof item === 'object') next.push(...Object.values(item as Record<string, unknown>))
+        continue
+      }
+      if (/^\d+$/.test(key) && Array.isArray(item)) {
+        next.push(item[Number(key)])
+        continue
+      }
+      if (typeof item === 'object') next.push((item as Record<string, unknown>)[key])
+    }
+    current = next
+  }
+
+  return current.flatMap((item) => Array.isArray(item) ? item : [item]).filter((item) => item != null)
+}
+
+function appendQuery(path: string, query?: Record<string, string>) {
+  if (!query || !Object.keys(query).length) return path
+  const params = new URLSearchParams()
+  for (const [key, value] of Object.entries(query)) params.set(key, value)
+  return `${path}${path.includes('?') ? '&' : '?'}${params.toString()}`
+}
+
+function resolveTemplateValue(value: unknown, context: Record<string, unknown>): unknown {
+  if (typeof value === 'string' && value.startsWith('$')) return getByPath(context, value.slice(1))
+  if (Array.isArray(value)) {
+    return value.map((item) => resolveTemplateValue(item, context)).filter((item) => item !== undefined && item !== null)
+  }
+  if (value && typeof value === 'object') {
+    const entries = Object.entries(value as Record<string, unknown>)
+      .map(([key, item]) => [key, resolveTemplateValue(item, context)] as const)
+      .filter(([, item]) => item !== undefined && item !== null && (!Array.isArray(item) || item.length > 0))
+    return Object.fromEntries(entries)
+  }
+  return value
+}
+
+function renderQuery(query: Record<string, string> | undefined, context: Record<string, unknown>): Record<string, string> | undefined {
+  if (!query) return undefined
+  const entries = Object.entries(query)
+    .map(([key, value]) => [key, resolveTemplateValue(value, context)] as const)
+    .filter(([, value]) => value !== undefined && value !== null && String(value) !== '')
+    .map(([key, value]) => [key, String(value)] as const)
+  return entries.length ? Object.fromEntries(entries) : undefined
+}
+
+function buildTaskPath(path: string, taskId: string) {
+  return path
+    .replace(/\{task_id\}/g, encodeURIComponent(taskId))
+    .replace(/\{taskId\}/g, encodeURIComponent(taskId))
+}
+
+function firstActualParams(list: Array<Partial<TaskParams> | undefined> | undefined) {
+  return list?.find((item) => item && Object.keys(item).length) ?? undefined
+}
+
+function mapActualParamsByImage(outputIds: string[], actualParamsList: Array<Partial<TaskParams> | undefined> | undefined) {
+  const entries = outputIds
+    .map((id, index) => [id, actualParamsList?.[index]] as const)
+    .filter((entry): entry is readonly [string, Partial<TaskParams>] => Boolean(entry[1] && Object.keys(entry[1]).length))
+  return entries.length ? Object.fromEntries(entries) : undefined
+}
+
+function pickActualParams(source: unknown): Partial<TaskParams> {
+  if (!isRecord(source)) return {}
+  const actual: Partial<TaskParams> = {}
+  if (typeof source.size === 'string') actual.size = source.size
+  if (source.quality === 'auto' || source.quality === 'low' || source.quality === 'medium' || source.quality === 'high') actual.quality = source.quality
+  if (source.output_format === 'png' || source.output_format === 'jpeg' || source.output_format === 'webp') actual.output_format = source.output_format
+  if (typeof source.output_compression === 'number') actual.output_compression = source.output_compression
+  if (source.moderation === 'auto' || source.moderation === 'low') actual.moderation = source.moderation
+  if (typeof source.n === 'number') actual.n = source.n
+  return actual
+}
+
+function mergeActualParams(...sources: Array<Partial<TaskParams> | undefined>): Partial<TaskParams> | undefined {
+  const merged = Object.assign({}, ...sources.filter((source) => source && Object.keys(source).length))
+  return Object.keys(merged).length ? merged : undefined
+}
+
+function genId(prefix = '') {
+  return `${prefix}${Date.now().toString(36)}${randomBytes(5).toString('hex')}`
+}
+
+function normalizeTaskForQueue(task: JsonRecord, stamp = now()): TaskRecord {
+  const params = taskParams(task.params)
+  return {
+    ...task,
+    id: asString(task.id) || genId('task_'),
+    prompt: asString(task.prompt),
+    params,
+    inputImageIds: Array.isArray(task.inputImageIds) ? task.inputImageIds.filter((id): id is string => typeof id === 'string') : [],
+    maskImageId: typeof task.maskImageId === 'string' ? task.maskImageId : null,
+    outputImages: Array.isArray(task.outputImages) ? task.outputImages.filter((id): id is string => typeof id === 'string') : [],
+    status: 'queued',
+    error: null,
+    createdAt: asNumber(task.createdAt, stamp),
+    queuedAt: asNumber(task.queuedAt, stamp),
+    startedAt: undefined,
+    finishedAt: null,
+    elapsed: null,
+  }
+}
+
+function insertGenerationJob(userId: number, taskId: string, request: GenerationRequest, queuedAt: number, jobId = genId('job_')) {
+  db.prepare(`
+    INSERT INTO generation_jobs (user_id, id, task_id, status, queued_at, request_json, created_at, updated_at)
+    VALUES (?, ?, ?, 'queued', ?, ?, ?, ?)
+  `).run(userId, jobId, taskId, queuedAt, JSON.stringify(request), queuedAt, queuedAt)
+  return jobId
+}
+
+function enqueueGenerationTask(userId: number, task: JsonRecord, request: GenerationRequest) {
+  const stamp = now()
+  const queuedTask = normalizeTaskForQueue(task, stamp)
+  putJsonRow('tasks', userId, queuedTask.id, queuedTask, queuedTask.createdAt, stamp)
+  insertGenerationJob(userId, queuedTask.id, request, queuedTask.queuedAt ?? stamp)
+  scheduleGenerationWorker()
+  return withQueuePosition(userId, queuedTask)
+}
+
+function getQueuePosition(userId: number, taskId: string) {
+  const row = db.prepare(`
+    SELECT id, task_id FROM generation_jobs
+    WHERE user_id = ? AND status = 'queued'
+    ORDER BY queued_at ASC, created_at ASC
+  `).all(userId)
+  const index = row.findIndex((item) => String(item.id) === taskId || String(item.task_id) === taskId)
+  return index >= 0 ? index + 1 : undefined
+}
+
+function withQueuePosition(userId: number, task: TaskRecord): TaskRecord {
+  if (task.status !== 'queued') return task
+  return { ...task, queuePosition: getQueuePosition(userId, task.id) }
+}
+
+function parseTaskCursor(cursor: string | null) {
+  if (!cursor) return null
+  const decoded = parseJson<JsonRecord>(Buffer.from(cursor, 'base64url').toString('utf8'), {})
+  const createdAt = asNumber(decoded.createdAt)
+  const id = asString(decoded.id)
+  return createdAt && id ? { createdAt, id } : null
+}
+
+function encodeTaskCursor(task: TaskRecord) {
+  return Buffer.from(JSON.stringify({ createdAt: task.createdAt, id: task.id })).toString('base64url')
+}
+
+function listTasksPage(userId: number, url: URL) {
+  const limit = Math.max(1, Math.min(100, Number.parseInt(url.searchParams.get('limit') || '50', 10) || 50))
+  const q = (url.searchParams.get('q') || '').trim().toLowerCase()
+  const status = url.searchParams.get('status') || 'all'
+  const favorite = url.searchParams.get('favorite') === 'true'
+  const cursor = parseTaskCursor(url.searchParams.get('cursor'))
+
+  const rows = db.prepare('SELECT id, json, created_at FROM tasks WHERE user_id = ? ORDER BY created_at DESC, id DESC').all(userId)
+  const filtered: TaskRecord[] = []
+  let passedCursor = cursor == null
+  for (const row of rows) {
+    const task = parseJson<TaskRecord>(String(row.json), null as any)
+    if (!task) continue
+    const createdAt = asNumber(task.createdAt, Number(row.created_at))
+    if (!passedCursor) {
+      if (createdAt < cursor!.createdAt || (createdAt === cursor!.createdAt && task.id < cursor!.id)) passedCursor = true
+      else continue
+    }
+    if (status !== 'all' && task.status !== status) continue
+    if (favorite && !task.isFavorite) continue
+    if (q) {
+      const haystack = `${task.prompt || ''}\n${JSON.stringify(task.params ?? {})}`.toLowerCase()
+      if (!haystack.includes(q)) continue
+    }
+    filtered.push(withQueuePosition(userId, task))
+    if (filtered.length > limit) break
+  }
+
+  const items = filtered.slice(0, limit)
+  const nextCursor = filtered.length > limit ? encodeTaskCursor(items[items.length - 1]) : undefined
+  return { items, ...(nextCursor ? { nextCursor } : {}) }
+}
+
+function listIncompleteTasks(userId: number) {
+  return db.prepare('SELECT json FROM tasks WHERE user_id = ? ORDER BY created_at DESC').all(userId)
+    .map((row) => parseJson<TaskRecord>(String(row.json), null as any))
+    .filter((task): task is TaskRecord => Boolean(task && (task.status === 'queued' || task.status === 'running')))
+    .map((task) => withQueuePosition(userId, task))
+}
+
+function listBatchTasks(userId: number, batchGroupId: string) {
+  return db.prepare('SELECT json FROM tasks WHERE user_id = ? ORDER BY created_at DESC').all(userId)
+    .map((row) => parseJson<TaskRecord>(String(row.json), null as any))
+    .filter((task): task is TaskRecord => Boolean(task && task.batchGroupId === batchGroupId && task.batchKind === 'gallery-image-to-image'))
+    .map((task) => withQueuePosition(userId, task))
+    .sort((a, b) => {
+      const aIndex = typeof a.batchIndex === 'number' ? a.batchIndex : Number.MAX_SAFE_INTEGER
+      const bIndex = typeof b.batchIndex === 'number' ? b.batchIndex : Number.MAX_SAFE_INTEGER
+      return aIndex - bIndex || a.createdAt - b.createdAt
+    })
+}
+
+function patchTask(userId: number, taskId: string, patch: JsonRecord) {
+  const task = getJsonRow<TaskRecord>('tasks', userId, taskId)
+  if (!task) return null
+  const next = { ...task, ...patch }
+  putJsonRow('tasks', userId, taskId, next, asNumber(next.createdAt), now())
+  return next as TaskRecord
+}
+
+let activeGenerationJobs = 0
+let generationWorkerScheduled = false
+const activeGenerationJobRegistry = new Map<string, ActiveGenerationJob>()
+
+function generationJobKey(userId: number, jobId: string) {
+  return `${userId}:${jobId}`
+}
+
+function getActiveGenerationJob(userId: number, jobId: string) {
+  return activeGenerationJobRegistry.get(generationJobKey(userId, jobId))
+}
+
+function assertGenerationJobActive(userId: number, jobId: string) {
+  const active = getActiveGenerationJob(userId, jobId)
+  if (active?.cancelled || active?.controller.signal.aborted) {
+    throw new DOMException('任务已取消', 'AbortError')
+  }
+  return active
+}
+
+function cancelGenerationJobsForTask(userId: number, taskId: string) {
+  const rows = db.prepare(`
+    SELECT id FROM generation_jobs
+    WHERE user_id = ? AND task_id = ? AND status IN ('queued', 'running')
+  `).all(userId, taskId) as Array<{ id: string }>
+  for (const row of rows) {
+    const active = getActiveGenerationJob(userId, String(row.id))
+    if (active) {
+      active.cancelled = true
+      active.controller.abort()
+    }
+  }
+  db.prepare(`
+    UPDATE generation_jobs
+    SET status = 'error', error = '任务已取消', finished_at = ?, updated_at = ?
+    WHERE user_id = ? AND task_id = ? AND status IN ('queued', 'running')
+  `).run(now(), now(), userId, taskId)
+}
+
+function cancelAllGenerationJobsForUser(userId: number) {
+  const rows = db.prepare(`
+    SELECT id FROM generation_jobs
+    WHERE user_id = ? AND status IN ('queued', 'running')
+  `).all(userId) as Array<{ id: string }>
+  for (const row of rows) {
+    const active = getActiveGenerationJob(userId, String(row.id))
+    if (active) {
+      active.cancelled = true
+      active.controller.abort()
+    }
+  }
+  db.prepare(`
+    UPDATE generation_jobs
+    SET status = 'error', error = '任务已取消', finished_at = ?, updated_at = ?
+    WHERE user_id = ? AND status IN ('queued', 'running')
+  `).run(now(), now(), userId)
+}
+
+function scheduleGenerationWorker() {
+  if (generationWorkerScheduled) return
+  generationWorkerScheduled = true
+  setTimeout(() => {
+    generationWorkerScheduled = false
+    void runGenerationWorker()
+  }, 0)
+}
+
+async function runGenerationWorker() {
+  while (activeGenerationJobs < GENERATION_CONCURRENCY) {
+    const row = db.prepare(`
+      SELECT id, user_id, task_id, status, queued_at, started_at, finished_at, request_json, error
+      FROM generation_jobs
+      WHERE status = 'queued'
+      ORDER BY queued_at ASC, created_at ASC
+      LIMIT 1
+    `).get() as GenerationJobRow | undefined
+    if (!row) return
+    activeGenerationJobs += 1
+    void executeGenerationJob(row).finally(() => {
+      activeGenerationJobs -= 1
+      scheduleGenerationWorker()
+    })
+  }
+}
+
+async function executeGenerationJob(job: GenerationJobRow) {
+  const startedAt = now()
+  const activeJob: ActiveGenerationJob = { controller: new AbortController(), cancelled: false }
+  activeGenerationJobRegistry.set(generationJobKey(job.user_id, job.id), activeJob)
+  const updated = db.prepare(`
+    UPDATE generation_jobs
+    SET status = 'running', started_at = ?, error = NULL, updated_at = ?
+    WHERE user_id = ? AND id = ? AND status = 'queued'
+  `).run(startedAt, startedAt, job.user_id, job.id)
+  if (updated.changes === 0) {
+    activeGenerationJobRegistry.delete(generationJobKey(job.user_id, job.id))
+    return
+  }
+  patchTask(job.user_id, job.task_id, { status: 'running', startedAt, error: null })
+
+  try {
+    assertGenerationJobActive(job.user_id, job.id)
+    const request = parseJson<GenerationRequest>(job.request_json, {} as GenerationRequest)
+    const result = await executeGenerationRequest(job.user_id, request, activeJob.controller.signal)
+    assertGenerationJobActive(job.user_id, job.id)
+    if (!result.images.length) {
+      const error = result.rawResponsePayload
+        ? '接口未返回可识别的图片数据，请查看原始响应内容确认服务商实际返回的数据结构。'
+        : '接口未返回图片数据'
+      throw Object.assign(new Error(error), { rawResponsePayload: result.rawResponsePayload })
+    }
+
+    const outputIds: string[] = []
+    for (const image of result.images) {
+      assertGenerationJobActive(job.user_id, job.id)
+      outputIds.push(await storeGeneratedImage(job.user_id, image))
+    }
+    assertGenerationJobActive(job.user_id, job.id)
+    const finishedAt = now()
+    const actualParamsList = result.actualParamsList?.length ? result.actualParamsList : outputIds.map(() => result.actualParams)
+    const revisedPromptByImage = result.revisedPrompts?.reduce<Record<string, string>>((acc, prompt, index) => {
+      const imageId = outputIds[index]
+      if (imageId && prompt?.trim()) acc[imageId] = prompt
+      return acc
+    }, {})
+    patchTask(job.user_id, job.task_id, {
+      outputImages: outputIds,
+      rawImageUrls: result.rawImageUrls?.length ? result.rawImageUrls : undefined,
+      rawResponsePayload: result.rawResponsePayload,
+      actualParams: mergeActualParams(result.actualParams, { n: outputIds.length }),
+      actualParamsByImage: mapActualParamsByImage(outputIds, actualParamsList),
+      revisedPromptByImage: revisedPromptByImage && Object.keys(revisedPromptByImage).length ? revisedPromptByImage : undefined,
+      status: 'done',
+      error: null,
+      finishedAt,
+      elapsed: Math.max(0, finishedAt - startedAt),
+    })
+    db.prepare(`
+      UPDATE generation_jobs
+      SET status = 'done', finished_at = ?, error = NULL, updated_at = ?
+      WHERE user_id = ? AND id = ?
+    `).run(finishedAt, finishedAt, job.user_id, job.id)
+  } catch (err) {
+    const finishedAt = now()
+    const isCancelled = activeJob.cancelled || (err instanceof DOMException && err.name === 'AbortError')
+    const message = isCancelled ? '任务已取消' : err instanceof Error ? err.message : String(err)
+    const rawResponsePayload = isRecord(err) && typeof err.rawResponsePayload === 'string' ? err.rawResponsePayload : undefined
+    if (!isCancelled || getJsonRow<TaskRecord>('tasks', job.user_id, job.task_id)) {
+      patchTask(job.user_id, job.task_id, {
+        status: 'error',
+        error: message,
+        rawResponsePayload,
+        finishedAt,
+        elapsed: Math.max(0, finishedAt - startedAt),
+      })
+    }
+    db.prepare(`
+      UPDATE generation_jobs
+      SET status = 'error', finished_at = ?, error = ?, updated_at = ?
+      WHERE user_id = ? AND id = ?
+    `).run(finishedAt, message, finishedAt, job.user_id, job.id)
+  } finally {
+    activeGenerationJobRegistry.delete(generationJobKey(job.user_id, job.id))
+  }
+}
+
 async function handleFalCall(req: IncomingMessage, res: ServerResponse, user: AuthUser) {
   assertMethod(req, 'POST')
   const body = await readJsonBody<JsonRecord>(req)
@@ -739,6 +1336,369 @@ async function handleFalResult(req: IncomingMessage, res: ServerResponse, user: 
   } finally {
     res.end()
   }
+}
+
+async function executeFalImageApi(userId: number, request: GenerationRequest, signal?: AbortSignal): Promise<CallApiResult> {
+  const profile = resolveProfileForUser(userId, request.profile)
+  configureFal(profile)
+  const body: JsonRecord = {
+    profile,
+    prompt: request.prompt,
+    params: request.params,
+    inputImageDataUrls: await readTaskImageDataUrls(userId, request.inputImageIds ?? []),
+    maskDataUrl: request.maskImageId ? await readTaskImageDataUrl(userId, request.maskImageId) : undefined,
+  }
+  const { input, endpoint, params } = createFalInput(body)
+  if (signal?.aborted) throw new DOMException('任务已取消', 'AbortError')
+  const result = await (fal as any).subscribe(endpoint, { input, logs: true })
+  if (signal?.aborted) throw new DOMException('任务已取消', 'AbortError')
+  return parseFalResult(result.data as JsonRecord, params)
+}
+
+function normalizeImageApiPayload(value: unknown): JsonRecord {
+  if (Array.isArray(value)) return { data: value }
+  return isRecord(value) ? value : { data: [] }
+}
+
+async function parseImagesApiResult(payload: unknown, params: TaskParams): Promise<CallApiResult> {
+  const normalized = normalizeImageApiPayload(payload)
+  const data = Array.isArray(normalized.data) ? normalized.data : []
+  if (!data.length) {
+    return { images: [], rawResponsePayload: JSON.stringify(normalized, null, 2) }
+  }
+
+  const mime = mimeForParams(params)
+  const images: string[] = []
+  const rawImageUrls: string[] = []
+  const revisedPrompts: Array<string | undefined> = []
+  for (const item of data) {
+    if (!isRecord(item)) continue
+    if (typeof item.b64_json === 'string' && item.b64_json.trim()) {
+      images.push(normalizeBase64DataUrl(item.b64_json, mime))
+      revisedPrompts.push(asString(item.revised_prompt) || undefined)
+      continue
+    }
+    if (isDataUrl(item.url)) {
+      images.push(item.url)
+      revisedPrompts.push(asString(item.revised_prompt) || undefined)
+      continue
+    }
+    if (isHttpUrl(item.url)) {
+      rawImageUrls.push(item.url)
+      images.push(await fetchImageUrlAsDataUrl(item.url, mime))
+      revisedPrompts.push(asString(item.revised_prompt) || undefined)
+    }
+  }
+  if (!images.length) return { images: [], rawResponsePayload: JSON.stringify(normalized, null, 2) }
+  const actualParams = mergeActualParams(pickActualParams(normalized), { n: images.length })
+  return {
+    images,
+    actualParams,
+    actualParamsList: images.map(() => actualParams),
+    revisedPrompts,
+    ...(rawImageUrls.length ? { rawImageUrls } : {}),
+  }
+}
+
+function getResponsesImageResultBase64(result: unknown): string | undefined {
+  const b64 = typeof result === 'string'
+    ? result
+    : isRecord(result)
+    ? asString(result.b64_json) || asString(result.base64) || asString(result.image) || asString(result.data)
+    : ''
+  return b64.trim() ? b64 : undefined
+}
+
+async function parseResponsesApiResult(payload: unknown, params: TaskParams): Promise<CallApiResult> {
+  const response = isRecord(payload) ? payload : {}
+  const output = Array.isArray(response.output) ? response.output : []
+  const mime = mimeForParams(params)
+  const images: string[] = []
+  const actualParamsList: Array<Partial<TaskParams> | undefined> = []
+  const revisedPrompts: Array<string | undefined> = []
+  for (const item of output) {
+    if (!isRecord(item) || item.type !== 'image_generation_call') continue
+    const b64 = getResponsesImageResultBase64(item.result)
+    if (!b64) continue
+    images.push(normalizeBase64DataUrl(b64, mime))
+    actualParamsList.push(mergeActualParams(pickActualParams(item)))
+    revisedPrompts.push(asString(item.revised_prompt) || undefined)
+  }
+  if (!images.length) return { images: [], rawResponsePayload: JSON.stringify(response, null, 2) }
+  return {
+    images,
+    actualParams: firstActualParams(actualParamsList),
+    actualParamsList,
+    revisedPrompts,
+    rawResponsePayload: JSON.stringify(response, null, 2),
+  }
+}
+
+function createResponsesInput(prompt: string, inputImageDataUrls: string[], referenceIds?: string[]): unknown {
+  const mapping = inputImageDataUrls.length && referenceIds?.length
+    ? `Attached reference images correspond to these ids, in order: ${referenceIds.map((id) => `<ref id="${id}" />`).join(', ')}.`
+    : ''
+  const text = [mapping, `${PROMPT_REWRITE_GUARD_PREFIX}\n${prompt}`].filter(Boolean).join('\n\n')
+  if (!inputImageDataUrls.length) return text
+  return [{
+    role: 'user',
+    content: [
+      { type: 'input_text', text },
+      ...inputImageDataUrls.map((dataUrl) => ({ type: 'input_image', image_url: dataUrl })),
+    ],
+  }]
+}
+
+function createResponsesImageTool(params: TaskParams, isEdit: boolean, profile: ApiProfile, maskDataUrl?: string) {
+  const tool: JsonRecord = {
+    type: 'image_generation',
+    action: isEdit ? 'edit' : 'generate',
+    size: params.size,
+    output_format: params.output_format,
+    moderation: params.moderation,
+  }
+  if (!profile.codexCli) tool.quality = params.quality
+  if (params.output_format !== 'png' && params.output_compression != null) tool.output_compression = params.output_compression
+  if (profile.streamImages) tool.partial_images = profile.streamPartialImages ?? 1
+  if (maskDataUrl) tool.input_image_mask = { image_url: maskDataUrl }
+  return tool
+}
+
+async function providerJsonRequest(profile: ApiProfile, path: string, body?: unknown, method = 'POST', signal?: AbortSignal) {
+  const response = await fetch(buildProviderUrl(profile, path), {
+    method,
+    headers: providerHeaders(profile, method === 'GET' || body === undefined ? undefined : 'application/json'),
+    body: method === 'GET' || body === undefined ? undefined : JSON.stringify(body),
+    signal,
+  })
+  if (!response.ok) throw new Error(await response.text() || `HTTP ${response.status}`)
+  return response.json()
+}
+
+async function providerMultipartRequest(profile: ApiProfile, path: string, body: FormData, method = 'POST', signal?: AbortSignal) {
+  const response = await fetch(buildProviderUrl(profile, path), {
+    method,
+    headers: providerHeaders(profile),
+    body: method === 'GET' ? undefined : body,
+    signal,
+  })
+  if (!response.ok) throw new Error(await response.text() || `HTTP ${response.status}`)
+  return response.json()
+}
+
+async function executeOpenAICompatibleImageApi(userId: number, request: GenerationRequest, signal?: AbortSignal): Promise<CallApiResult> {
+  const profile = resolveProfileForUser(userId, request.profile)
+  const params = taskParams(request.params)
+  const inputImageDataUrls = await readTaskImageDataUrls(userId, request.inputImageIds ?? [])
+  const maskDataUrl = request.maskImageId ? await readTaskImageDataUrl(userId, request.maskImageId) : undefined
+  const customProvider = getCustomProviderDefinition(request.settings, profile.provider)
+  if (customProvider) {
+    return executeCustomHttpImageApi(profile, customProvider, {
+      prompt: asString(request.prompt),
+      params,
+      inputImageDataUrls,
+      maskDataUrl,
+    }, signal)
+  }
+
+  if (profile.apiMode === 'responses') {
+    const body: JsonRecord = {
+      model: profile.model,
+      input: createResponsesInput(asString(request.prompt), inputImageDataUrls, request.referenceIds),
+      tools: [createResponsesImageTool(params, inputImageDataUrls.length > 0, profile, maskDataUrl)],
+      tool_choice: 'required',
+    }
+    const payload = await providerJsonRequest(profile, 'responses', body, 'POST', signal)
+    return parseResponsesApiResult(payload, params)
+  }
+
+  if (inputImageDataUrls.length) {
+    const formData = new FormData()
+    formData.append('model', asString(profile.model))
+    formData.append('prompt', profile.codexCli ? `${PROMPT_REWRITE_GUARD_PREFIX}\n${asString(request.prompt)}` : asString(request.prompt))
+    formData.append('size', params.size)
+    formData.append('output_format', params.output_format)
+    formData.append('moderation', params.moderation)
+    if (!profile.codexCli) formData.append('quality', params.quality)
+    if (params.output_format !== 'png' && params.output_compression != null) formData.append('output_compression', String(params.output_compression))
+    if (params.n > 1) formData.append('n', String(params.n))
+    if (profile.responseFormatB64Json) formData.append('response_format', 'b64_json')
+    for (let i = 0; i < inputImageDataUrls.length; i++) {
+      const { mime, bytes } = dataUrlToBuffer(inputImageDataUrls[i])
+      formData.append('image[]', new Blob([bytes], { type: mime }), `input-${i + 1}.${mimeToExt(mime)}`)
+    }
+    if (maskDataUrl) {
+      const { bytes } = dataUrlToBuffer(maskDataUrl)
+      formData.append('mask', new Blob([bytes], { type: 'image/png' }), 'mask.png')
+    }
+    const payload = await providerMultipartRequest(profile, 'images/edits', formData, 'POST', signal)
+    return parseImagesApiResult(payload, params)
+  }
+
+  const body: JsonRecord = {
+    model: profile.model,
+    prompt: profile.codexCli ? `${PROMPT_REWRITE_GUARD_PREFIX}\n${asString(request.prompt)}` : asString(request.prompt),
+    size: params.size,
+    output_format: params.output_format,
+    moderation: params.moderation,
+  }
+  if (!profile.codexCli) body.quality = params.quality
+  if (params.output_format !== 'png' && params.output_compression != null) body.output_compression = params.output_compression
+  if (params.n > 1) body.n = params.n
+  if (profile.responseFormatB64Json) body.response_format = 'b64_json'
+  const payload = await providerJsonRequest(profile, 'images/generations', body, 'POST', signal)
+  return parseImagesApiResult(payload, params)
+}
+
+function createCustomProviderContext(opts: { prompt: string; params: TaskParams; inputImageDataUrls: string[]; maskDataUrl?: string }, profile: ApiProfile) {
+  return {
+    profile,
+    prompt: opts.prompt,
+    params: opts.params,
+    inputImages: {
+      dataUrls: opts.inputImageDataUrls.length ? opts.inputImageDataUrls : undefined,
+      count: opts.inputImageDataUrls.length,
+    },
+    mask: {
+      dataUrl: opts.maskDataUrl,
+    },
+  }
+}
+
+async function createCustomMultipartBody(
+  mapping: CustomProviderSubmitMapping,
+  opts: { prompt: string; params: TaskParams; inputImageDataUrls: string[]; maskDataUrl?: string },
+  context: Record<string, unknown>,
+) {
+  const formData = new FormData()
+  const body = resolveTemplateValue(mapping.body ?? {}, context)
+  if (body && typeof body === 'object' && !Array.isArray(body)) {
+    for (const [key, value] of Object.entries(body as Record<string, unknown>)) {
+      if (value === undefined || value === null) continue
+      if (Array.isArray(value)) {
+        for (const item of value) formData.append(key, String(item))
+      } else {
+        formData.append(key, String(value))
+      }
+    }
+  }
+
+  const imageParts = opts.inputImageDataUrls.map((dataUrl) => dataUrlToBuffer(dataUrl))
+  const maskPart = opts.maskDataUrl ? dataUrlToBuffer(opts.maskDataUrl) : null
+  for (const file of mapping.files ?? []) {
+    if (file.source === 'inputImages') {
+      for (let i = 0; i < imageParts.length; i++) {
+        const part = imageParts[i]
+        formData.append(file.field, new Blob([part.bytes], { type: part.mime }), `input-${i + 1}.${mimeToExt(part.mime)}`)
+      }
+    } else if (file.source === 'mask' && maskPart) {
+      formData.append(file.field, new Blob([maskPart.bytes], { type: maskPart.mime }), `mask.${mimeToExt(maskPart.mime)}`)
+    }
+  }
+  return formData
+}
+
+async function extractCustomImages(payload: unknown, result: CustomProviderResultMapping | undefined, params: TaskParams): Promise<CallApiResult> {
+  const mapping = result ?? {}
+  const mime = mimeForParams(params)
+  const images: string[] = []
+  const imageUrls = (mapping.imageUrlPaths ?? []).flatMap((path) =>
+    getAllByPath(payload, path).filter((value): value is string => isHttpUrl(value) || isDataUrl(value)),
+  )
+  const rawImageUrls = imageUrls.filter(isHttpUrl)
+  for (const path of mapping.b64JsonPaths ?? []) {
+    for (const value of getAllByPath(payload, path)) {
+      if (typeof value === 'string' && value.trim()) images.push(normalizeBase64DataUrl(value, mime))
+    }
+  }
+  for (const url of imageUrls) {
+    images.push(isDataUrl(url) ? url : await fetchImageUrlAsDataUrl(url, mime))
+  }
+  if (!images.length) {
+    return { images: [], rawResponsePayload: JSON.stringify(payload, null, 2) }
+  }
+  return { images, actualParams: { n: images.length }, actualParamsList: images.map(() => ({ n: 1 })), ...(rawImageUrls.length ? { rawImageUrls } : {}) }
+}
+
+function getTaskState(payload: unknown, poll: CustomProviderPollMapping): 'success' | 'failure' | 'pending' {
+  const status = getByPath(payload, poll.statusPath)
+  const statusText = typeof status === 'string' ? status : String(status ?? '')
+  if (poll.successValues.includes(statusText)) return 'success'
+  if (poll.failureValues.includes(statusText)) return 'failure'
+  return 'pending'
+}
+
+function sleep(ms: number, signal?: AbortSignal) {
+  return new Promise<void>((resolvePromise, reject) => {
+    if (signal?.aborted) {
+      reject(new DOMException('任务已取消', 'AbortError'))
+      return
+    }
+    const timer = setTimeout(resolvePromise, ms)
+    signal?.addEventListener('abort', () => {
+      clearTimeout(timer)
+      reject(new DOMException('任务已取消', 'AbortError'))
+    }, { once: true })
+  })
+}
+
+async function pollCustomTaskResult(profile: ApiProfile, poll: CustomProviderPollMapping, taskId: string, params: TaskParams, signal?: AbortSignal): Promise<CallApiResult> {
+  let first = true
+  let attempts = 0
+  const timeoutSeconds = Math.max(1, asNumber(poll.timeoutSeconds, CUSTOM_POLL_TIMEOUT_SECONDS))
+  const maxAttempts = asNumber(poll.maxAttempts)
+  const deadline = Date.now() + timeoutSeconds * 1000
+  const context = { profile, params, taskId }
+  while (true) {
+    if (signal?.aborted) throw new DOMException('任务已取消', 'AbortError')
+    if (Date.now() > deadline) throw new Error(`自定义异步任务轮询超时（超过 ${timeoutSeconds} 秒）`)
+    if (maxAttempts && attempts >= maxAttempts) throw new Error(`自定义异步任务轮询超出最大次数（${maxAttempts} 次）`)
+    if (first) first = false
+    else await sleep((poll.intervalSeconds ?? 5) * 1000, signal)
+    attempts += 1
+
+    const taskPath = appendQuery(buildTaskPath(poll.path, taskId), renderQuery(poll.query, context))
+    const payload = await providerJsonRequest(profile, taskPath, undefined, poll.method ?? 'GET', signal)
+    const state = getTaskState(payload, poll)
+    if (state === 'failure') {
+      const message = getByPath(payload, poll.errorPath) || getByPath(payload, 'message') || getByPath(payload, 'error.message')
+      throw new Error(typeof message === 'string' && message.trim() ? message : '异步任务失败')
+    }
+    if (state === 'success') return extractCustomImages(payload, poll.result, params)
+  }
+}
+
+async function executeCustomHttpImageApi(
+  profile: ApiProfile,
+  customProvider: CustomProviderDefinition,
+  opts: { prompt: string; params: TaskParams; inputImageDataUrls: string[]; maskDataUrl?: string },
+  signal?: AbortSignal,
+): Promise<CallApiResult> {
+  const isEdit = opts.inputImageDataUrls.length > 0
+  const mapping = isEdit && customProvider.editSubmit ? customProvider.editSubmit : customProvider.submit
+  const context = createCustomProviderContext(opts, profile)
+  const method = mapping.method ?? 'POST'
+  const path = appendQuery(mapping.path, renderQuery(mapping.query, context))
+  let payload: unknown
+  if (method !== 'GET' && (mapping.contentType ?? 'json') === 'multipart') {
+    payload = await providerMultipartRequest(profile, path, await createCustomMultipartBody(mapping, opts, context), method, signal)
+  } else {
+    const body = method === 'GET' ? undefined : resolveTemplateValue(mapping.body ?? {}, context)
+    payload = await providerJsonRequest(profile, path, body, method, signal)
+  }
+
+  const taskIdValue = mapping.taskIdPath ? getByPath(payload, mapping.taskIdPath) : undefined
+  const taskId = typeof taskIdValue === 'string' ? taskIdValue.trim() : String(taskIdValue ?? '').trim()
+  if (!taskId) return extractCustomImages(payload, mapping.result, opts.params)
+  if (!customProvider.poll) throw new Error('异步接口返回了 task_id，但服务商配置缺少 poll')
+  return pollCustomTaskResult(profile, customProvider.poll, taskId, opts.params, signal)
+}
+
+async function executeGenerationRequest(userId: number, request: GenerationRequest, signal?: AbortSignal): Promise<CallApiResult> {
+  const profile = resolveProfileForUser(userId, request.profile)
+  return profile.provider === 'fal'
+    ? executeFalImageApi(userId, { ...request, profile }, signal)
+    : executeOpenAICompatibleImageApi(userId, { ...request, profile }, signal)
 }
 
 async function handleProviderJson(req: IncomingMessage, res: ServerResponse, user: AuthUser) {
@@ -832,14 +1792,29 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL) {
   }
 
   if (pathname === '/api/tasks') {
-    if (req.method === 'GET') return sendJson(res, 200, tableJsonRows('tasks', user.id, 'created_at DESC'))
+    if (req.method === 'GET') return sendJson(res, 200, listTasksPage(user.id, url))
     if (req.method === 'DELETE') {
+      cancelAllGenerationJobsForUser(user.id)
       clearJsonRows('tasks', user.id)
+      db.prepare('DELETE FROM generation_jobs WHERE user_id = ?').run(user.id)
       return sendNoContent(res)
     }
   }
+  if (pathname.startsWith('/api/tasks/batch/')) {
+    assertMethod(req, 'GET')
+    const batchGroupId = decodeURIComponent(pathname.slice('/api/tasks/batch/'.length))
+    return sendJson(res, 200, listBatchTasks(user.id, batchGroupId))
+  }
+  if (pathname === '/api/tasks/incomplete') {
+    assertMethod(req, 'GET')
+    return sendJson(res, 200, listIncompleteTasks(user.id))
+  }
   if (pathname.startsWith('/api/tasks/')) {
     const id = decodeURIComponent(pathname.slice('/api/tasks/'.length))
+    if (req.method === 'GET') {
+      const task = getJsonRow<TaskRecord>('tasks', user.id, id)
+      return sendJson(res, 200, task ? withQueuePosition(user.id, task) : null)
+    }
     if (req.method === 'PUT') {
       const body = await readJsonBody<JsonRecord>(req)
       const task: JsonRecord = isRecord(body.task) ? { ...body.task, id } : { id }
@@ -847,9 +1822,19 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL) {
       return sendJson(res, 200, { id })
     }
     if (req.method === 'DELETE') {
+      cancelGenerationJobsForTask(user.id, id)
       deleteJsonRow('tasks', user.id, id)
+      db.prepare('DELETE FROM generation_jobs WHERE user_id = ? AND task_id = ?').run(user.id, id)
       return sendNoContent(res)
     }
+  }
+
+  if (pathname === '/api/generation/tasks') {
+    assertMethod(req, 'POST')
+    const body = await readJsonBody<JsonRecord>(req)
+    if (!isRecord(body.task)) throw Object.assign(new Error('缺少 task'), { statusCode: 400 })
+    if (!isRecord(body.request)) throw Object.assign(new Error('缺少 request'), { statusCode: 400 })
+    return sendJson(res, 200, { task: enqueueGenerationTask(user.id, body.task, body.request as GenerationRequest) })
   }
 
   if (pathname === '/api/agent/conversations') {
@@ -1024,6 +2009,7 @@ async function serveStatic(res: ServerResponse, pathname: string) {
 initDb()
 syncUsersFromConfig()
 rmSync(join(dataDir, 'tmp'), { recursive: true, force: true })
+scheduleGenerationWorker()
 
 const server = createServer((req, res) => {
   void (async () => {

@@ -282,7 +282,9 @@ export default function TaskCard({
   const duration = (() => {
     let seconds: number
     if (task.status === 'running' || task.falRecoverable || task.customRecoverable) {
-      seconds = Math.floor((now - task.createdAt) / 1000)
+      seconds = Math.floor((now - (task.startedAt ?? task.createdAt)) / 1000)
+    } else if (task.status === 'queued') {
+      seconds = 0
     } else if (task.elapsed != null) {
       seconds = Math.floor(task.elapsed / 1000)
     } else {
@@ -348,6 +350,8 @@ export default function TaskCard({
         } ${
           task.status === 'running'
             ? 'border-blue-400 generating'
+            : task.status === 'queued'
+            ? 'border-gray-300 dark:border-white/[0.14]'
             : isSelected
             ? 'border-blue-500 shadow-md ring-2 ring-blue-500/50'
             : 'border-gray-200 dark:border-white/[0.08] hover:border-gray-300 dark:hover:border-white/[0.18]'
@@ -435,6 +439,16 @@ export default function TaskCard({
               <span className="text-xs text-gray-400 dark:text-gray-500">生成中...</span>
             </div>
           )}
+          {task.status === 'queued' && (
+            <div className="flex flex-col items-center gap-1 px-2">
+              <svg className="h-7 w-7 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+              </svg>
+              <span className="text-center text-xs leading-tight text-gray-500">
+                排队中{task.queuePosition ? ` #${task.queuePosition}` : ''}
+              </span>
+            </div>
+          )}
           {task.status === 'error' && isFalReconnecting && (
             <div className="flex flex-col items-center gap-1 px-2">
               <svg
@@ -514,7 +528,7 @@ export default function TaskCard({
                 <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
                 </svg>
-                {duration}
+                {task.status === 'queued' ? '排队' : duration}
               </span>
             ) : (
               <>
