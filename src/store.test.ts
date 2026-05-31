@@ -64,7 +64,9 @@ vi.mock('./lib/db', () => {
       thumbnails.clear()
     },
     storeImage: async (dataUrl: string, source: StoredImage['source'] = 'upload') => {
-      const id = `stored-image-${++imageSeq}`
+      const existing = [...images.values()].find((image) => image.dataUrl === dataUrl && image.source === source)
+      if (existing) return existing.id
+      const id = `stored-${source}-${++imageSeq}`
       images.set(id, { id, dataUrl, source, createdAt: Date.now() })
       return id
     },
@@ -199,6 +201,20 @@ describe('mask draft lifecycle in store actions', () => {
     await editOutputs(task({ outputImages: [imageA.id] }))
 
     expect(useStore.getState().maskDraft).toEqual(maskDraft)
+  })
+
+  it('adds edited outputs as separate upload images', async () => {
+    await clearImages()
+    await putImage({ ...imageB, source: 'generated' })
+    useStore.setState({ inputImages: [imageA] })
+
+    await editOutputs(task({ outputImages: [imageB.id] }))
+
+    const inputImages = useStore.getState().inputImages
+    expect(inputImages).toHaveLength(2)
+    expect(inputImages[1]?.id).not.toBe(imageB.id)
+    expect(inputImages[1]?.id).toMatch(/^stored-upload-/)
+    expect(inputImages[1]?.dataUrl).toBe(imageB.dataUrl)
   })
 
   it('clears an invalid mask draft when submit cannot find the mask target image', async () => {
@@ -1493,7 +1509,9 @@ describe('agent batch reference resolution', () => {
     const [, request] = vi.mocked(backendGeneration.createTask).mock.calls.find(([, request]) =>
       request.referenceIds?.includes('round-2-image-1'),
     )!
-    expect(request.inputImageIds).toEqual([imageB.id])
+    expect(request.inputImageIds).toHaveLength(1)
+    expect(request.inputImageIds[0]).not.toBe(imageB.id)
+    expect(request.inputImageIds[0]).toMatch(/^stored-upload-/)
     expect(request.inputImageIds).not.toContain(imageA.id)
     expect(request.referenceIds).toEqual(['round-2-image-1'])
   })
@@ -1533,7 +1551,9 @@ describe('agent batch reference resolution', () => {
     const [, request] = vi.mocked(backendGeneration.createTask).mock.calls.find(([, request]) =>
       request.referenceIds?.includes('round-3-reference-1'),
     )!
-    expect(request.inputImageIds).toEqual([imageA.id])
+    expect(request.inputImageIds).toHaveLength(1)
+    expect(request.inputImageIds[0]).not.toBe(imageA.id)
+    expect(request.inputImageIds[0]).toMatch(/^stored-upload-/)
     expect(request.referenceIds).toEqual(['round-3-reference-1'])
   })
 })
@@ -1730,7 +1750,13 @@ describe('reused task API profile', () => {
     }))
 
     const state = useStore.getState()
-    expect(state.inputImages.map((img) => img.id)).toEqual([imageA.id, imageB.id])
+    expect(state.inputImages.map((img) => img.id)).toHaveLength(2)
+    expect(state.inputImages.map((img) => img.id)).not.toEqual([imageA.id, imageB.id])
+    expect(state.inputImages.map((img) => img.id)).toEqual([
+      expect.stringMatching(/^stored-upload-/),
+      expect.stringMatching(/^stored-upload-/),
+    ])
+    expect(state.inputImages.map((img) => img.dataUrl)).toEqual([imageA.dataUrl, imageB.dataUrl])
     expect(state.prompt).toBe(taskPrompt)
   })
 

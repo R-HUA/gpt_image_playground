@@ -1,10 +1,12 @@
 import { useEffect, useState } from 'react'
 import type { TaskRecord } from '../types'
 import { ensureImageThumbnailCached, subscribeImageThumbnail } from '../store'
+import { TrashIcon } from './icons'
 
 interface Props {
   tasks: TaskRecord[]
   onClick: (e: React.MouseEvent | React.TouchEvent) => void
+  onDelete?: () => void
   isSelected?: boolean
 }
 
@@ -12,9 +14,10 @@ function countStatus(tasks: TaskRecord[], status: TaskRecord['status']) {
   return tasks.filter((task) => task.status === status).length
 }
 
-export default function BatchTaskCard({ tasks, onClick, isSelected }: Props) {
+export default function BatchTaskCard({ tasks, onClick, onDelete, isSelected }: Props) {
   const sorted = [...tasks].sort((a, b) => (a.batchIndex ?? 0) - (b.batchIndex ?? 0))
   const first = sorted[0]
+  const total = first?.batchSize && first.batchSize > sorted.length ? first.batchSize : sorted.length
   const coverImageId = sorted.find((task) => task.outputImages[0])?.outputImages[0]
   const [thumbSrc, setThumbSrc] = useState('')
 
@@ -49,6 +52,22 @@ export default function BatchTaskCard({ tasks, onClick, isSelected }: Props) {
       }`}
       onClick={onClick}
     >
+      {onDelete && (
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation()
+            onDelete()
+          }}
+          onTouchStart={(e) => e.stopPropagation()}
+          onTouchEnd={(e) => e.stopPropagation()}
+          className="absolute right-2 top-2 z-10 rounded-md bg-white/90 p-1.5 text-gray-400 shadow-sm ring-1 ring-black/5 transition hover:bg-red-50 hover:text-red-500 dark:bg-gray-950/90 dark:ring-white/10 dark:hover:bg-red-500/10"
+          title="删除批量任务"
+          aria-label="删除批量任务"
+        >
+          <TrashIcon className="h-4 w-4" />
+        </button>
+      )}
       <div className="flex h-40 cursor-pointer">
         <div className="relative flex h-full w-40 min-w-[10rem] flex-shrink-0 items-center justify-center overflow-hidden bg-gray-100 dark:bg-black/20">
           {thumbSrc ? (
@@ -62,7 +81,7 @@ export default function BatchTaskCard({ tasks, onClick, isSelected }: Props) {
             </div>
           )}
           <span className="absolute bottom-1 right-1 rounded bg-black/60 px-1.5 py-0.5 text-xs text-white">
-            {done}/{sorted.length}
+            {done}/{total}
           </span>
         </div>
         <div className="flex min-w-0 flex-1 flex-col p-3">
@@ -72,7 +91,7 @@ export default function BatchTaskCard({ tasks, onClick, isSelected }: Props) {
             </p>
           </div>
           <div className="mt-auto flex flex-wrap gap-1.5 text-xs">
-            <span className="rounded bg-gray-100 px-1.5 py-0.5 text-gray-600 dark:bg-white/[0.04] dark:text-gray-300">总数 {sorted.length}</span>
+            <span className="rounded bg-gray-100 px-1.5 py-0.5 text-gray-600 dark:bg-white/[0.04] dark:text-gray-300">总数 {total}</span>
             <span className="rounded bg-green-50 px-1.5 py-0.5 text-green-600 dark:bg-green-500/10 dark:text-green-300">完成 {done}</span>
             <span className="rounded bg-blue-50 px-1.5 py-0.5 text-blue-600 dark:bg-blue-500/10 dark:text-blue-300">运行 {running}</span>
             <span className="rounded bg-gray-100 px-1.5 py-0.5 text-gray-500 dark:bg-white/[0.04]">排队 {queued}</span>

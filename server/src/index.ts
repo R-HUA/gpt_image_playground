@@ -94,6 +94,7 @@ type CallApiResult = {
   rawResponsePayload?: string
 }
 type TaskStatus = 'queued' | 'running' | 'done' | 'error'
+type StoredImageSource = 'upload' | 'generated' | 'mask'
 type TaskRecord = JsonRecord & {
   id: string
   prompt: string
@@ -141,6 +142,7 @@ type ActiveGenerationJob = {
   controller: AbortController
   cancelled: boolean
 }
+type LogLevel = 'debug' | 'info' | 'warn' | 'error'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const projectRoot = resolve(__dirname, '../..')
@@ -174,6 +176,83 @@ function parseJson<T = unknown>(text: string, fallback: T): T {
     return JSON.parse(text) as T
   } catch {
     return fallback
+  }
+}
+
+const LOG_LEVEL_VALUES: Record<LogLevel, number> = { debug: 10, info: 20, warn: 30, error: 40 }
+const LOG_LEVEL = parseLogLevel(process.env.GIP_LOG_LEVEL)
+
+function parseLogLevel(value: unknown): LogLevel {
+  if (value === 'debug' || value === 'info' || value === 'warn' || value === 'error') return value
+  return 'info'
+}
+
+function truncateForLog(value: string, maxLength = 1000) {
+  return value.length > maxLength ? `${value.slice(0, maxLength)}...` : value
+}
+
+function serializeErrorForLog(err: unknown) {
+  if (err instanceof Error) {
+    return {
+      name: err.name,
+      message: err.message,
+      stack: err.stack ? truncateForLog(err.stack, 4000) : undefined,
+    }
+  }
+  return { message: String(err) }
+}
+
+function logEvent(level: LogLevel, event: string, fields: JsonRecord = {}) {
+  if (LOG_LEVEL_VALUES[level] < LOG_LEVEL_VALUES[LOG_LEVEL]) return
+  const entry = {
+    ts: new Date().toISOString(),
+    level,
+    event,
+    ...fields,
+  }
+  const line = JSON.stringify(entry)
+  if (level === 'error') console.error(line)
+  else if (level === 'warn') console.warn(line)
+  else console.log(line)
+}
+
+function logDebug(event: string, fields?: JsonRecord) {
+  logEvent('debug', event, fields)
+}
+
+function logInfo(event: string, fields?: JsonRecord) {
+  logEvent('info', event, fields)
+}
+
+function logWarn(event: string, fields?: JsonRecord) {
+  logEvent('warn', event, fields)
+}
+
+function logError(event: string, fields?: JsonRecord) {
+  logEvent('error', event, fields)
+}
+
+function summarizeProfile(profile: ApiProfile | undefined) {
+  return {
+    provider: profile?.provider || 'openai',
+    profileId: profile?.id,
+    profileName: profile?.name,
+    apiMode: profile?.apiMode,
+    model: profile?.model,
+    hasApiKey: Boolean(profile?.apiKey),
+  }
+}
+
+function providerUrlLogFields(url: string) {
+  try {
+    const parsed = new URL(url)
+    return {
+      providerHost: parsed.host,
+      providerPath: parsed.pathname,
+      hasQuery: Boolean(parsed.search),
+    }
+  } catch {
+    return { providerUrl: truncateForLog(url, 500) }
   }
 }
 
@@ -333,7 +412,7 @@ function getUserById(id: number): AuthUser | null {
 
 function syncUsersFromConfig() {
   if (!existsSync(configPath)) {
-    console.warn(`[server] Users config not found: ${configPath}. Create it from config/users.example.json before logging in.`)
+    logWarn('users_config_missing', { configPath })
     return
   }
 
@@ -346,7 +425,7 @@ function syncUsersFromConfig() {
     : []
 
   if (!users.length) {
-    console.warn(`[server] Users config contains no users: ${configPath}`)
+    logWarn('users_config_empty', { configPath })
     return
   }
 
@@ -362,7 +441,7 @@ function syncUsersFromConfig() {
       const { salt, hash } = hashPassword(password)
       db.prepare('INSERT INTO users (username, password_hash, password_salt, created_at, updated_at) VALUES (?, ?, ?, ?, ?)')
         .run(username, hash, salt, stamp, stamp)
-      console.log(`[server] Imported user: ${username}`)
+      logInfo('user_imported', { username })
       continue
     }
 
@@ -371,7 +450,7 @@ function syncUsersFromConfig() {
       db.prepare('UPDATE users SET password_hash = ?, password_salt = ?, updated_at = ? WHERE id = ?')
         .run(hash, salt, stamp, existing.id)
       db.prepare('UPDATE refresh_tokens SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL').run(stamp, existing.id)
-      console.log(`[server] Updated password for user: ${username}`)
+      logInfo('user_password_updated', { username })
     }
   }
 }
@@ -463,7 +542,7 @@ function sendNoContent(res: ServerResponse) {
 function sendError(res: ServerResponse, err: unknown) {
   const statusCode = isRecord(err) && typeof err.statusCode === 'number' ? err.statusCode : 500
   const message = err instanceof Error ? err.message : String(err)
-  if (statusCode >= 500) console.error(err)
+  if (statusCode >= 500) logError('request_unhandled_error', { statusCode, error: serializeErrorForLog(err) })
   sendJson(res, statusCode, { error: message || '服务器错误' })
 }
 
@@ -576,8 +655,44 @@ async function ensureParent(path: string) {
   await mkdir(dirname(path), { recursive: true })
 }
 
-function userFilePath(userId: number, kind: 'images' | 'thumbnails', id: string, mime: string) {
-  return join('users', String(userId), kind, `${safeSegment(id)}.${mimeToExt(mime)}`)
+function normalizeStoredImageSource(value: unknown): StoredImageSource {
+  if (value === 'generated' || value === 'mask') return value
+  return 'upload'
+}
+
+function imageFileScope(source: StoredImageSource) {
+  if (source === 'generated') return 'outputs'
+  if (source === 'mask') return 'masks'
+  return 'inputs'
+}
+
+function sourceIdPrefix(source: StoredImageSource) {
+  if (source === 'generated') return 'out'
+  if (source === 'mask') return 'mask'
+  return 'in'
+}
+
+function createStoredImageId(dataUrl: string, source: StoredImageSource) {
+  const hash = createHash('sha256').update(dataUrl).digest('hex')
+  return `${sourceIdPrefix(source)}_${hash}`
+}
+
+function storedFileSource(kind: 'images' | 'thumbnails', userId: number, id: string, record: JsonRecord): StoredImageSource {
+  const explicit = record.source
+  if (explicit === 'upload' || explicit === 'generated' || explicit === 'mask') return explicit
+  if (kind === 'thumbnails') {
+    const image = getStoredFileMetadata('images', userId, id)
+    return normalizeStoredImageSource(image?.source)
+  }
+  return 'upload'
+}
+
+function userFilePath(userId: number, kind: 'images' | 'thumbnails', id: string, mime: string, source: StoredImageSource = 'upload') {
+  const scope = imageFileScope(source)
+  const fileName = `${safeSegment(id)}.${mimeToExt(mime)}`
+  return kind === 'thumbnails'
+    ? join('users', String(userId), 'thumbnails', scope, fileName)
+    : join('users', String(userId), scope, fileName)
 }
 
 function absoluteDataPath(relativePath: string) {
@@ -599,7 +714,8 @@ async function putStoredFile(kind: 'images' | 'thumbnails', userId: number, id: 
   const dataUrl = asString(record[dataUrlField])
   if (!dataUrl) throw Object.assign(new Error('缺少图片数据'), { statusCode: 400 })
   const { mime, bytes } = dataUrlToBuffer(dataUrl)
-  const relativePath = userFilePath(userId, kind, id, mime)
+  const source = storedFileSource(kind, userId, id, record)
+  const relativePath = userFilePath(userId, kind, id, mime, source)
   const absolute = absoluteDataPath(relativePath)
   await ensureParent(absolute)
   writeFileSync(absolute, bytes)
@@ -608,7 +724,7 @@ async function putStoredFile(kind: 'images' | 'thumbnails', userId: number, id: 
   const previous = db.prepare(`SELECT file_path FROM ${table} WHERE user_id = ? AND id = ?`).get(userId, id)
   if (previous && previous.file_path !== relativePath) removeFileIfExists(previous.file_path)
 
-  const metadata: JsonRecord = { ...record, id }
+  const metadata: JsonRecord = { ...record, id, source }
   delete metadata[dataUrlField]
   const stamp = now()
   db.prepare(`
@@ -654,17 +770,26 @@ async function readTaskImageDataUrls(userId: number, ids: string[]) {
 }
 
 async function storeGeneratedImage(userId: number, dataUrl: string) {
-  const id = createHash('sha256').update(dataUrl).digest('hex')
+  const source: StoredImageSource = 'generated'
+  const id = createStoredImageId(dataUrl, source)
   const existing = getStoredFile('images', userId, id)
+  const { mime } = dataUrlToBuffer(dataUrl)
+  const filePath = userFilePath(userId, 'images', id, mime, source)
   if (!existing) {
     await putStoredFile('images', userId, id, {
       id,
       dataUrl,
       createdAt: now(),
-      source: 'generated',
+      source,
     }, 'dataUrl')
   }
-  return id
+  logDebug('generated_image_stored', {
+    userId,
+    imageId: id,
+    filePath,
+    isNew: !existing,
+  })
+  return { id, filePath }
 }
 
 function getStoredFileMetadata(kind: 'images' | 'thumbnails', userId: number, id: string) {
@@ -1030,6 +1155,16 @@ function insertGenerationJob(userId: number, taskId: string, request: Generation
     INSERT INTO generation_jobs (user_id, id, task_id, status, queued_at, request_json, created_at, updated_at)
     VALUES (?, ?, ?, 'queued', ?, ?, ?, ?)
   `).run(userId, jobId, taskId, queuedAt, JSON.stringify(request), queuedAt, queuedAt)
+  logInfo('generation_job_enqueued', {
+    userId,
+    taskId,
+    jobId,
+    queuedAt,
+    profile: summarizeProfile(request.profile),
+    inputImageCount: request.inputImageIds?.length ?? 0,
+    hasMask: Boolean(request.maskImageId),
+    requestedImages: taskParams(request.params).n,
+  })
   return jobId
 }
 
@@ -1166,6 +1301,7 @@ function cancelGenerationJobsForTask(userId: number, taskId: string) {
     SET status = 'error', error = '任务已取消', finished_at = ?, updated_at = ?
     WHERE user_id = ? AND task_id = ? AND status IN ('queued', 'running')
   `).run(now(), now(), userId, taskId)
+  if (rows.length) logInfo('generation_jobs_cancelled_for_task', { userId, taskId, jobCount: rows.length })
 }
 
 function cancelAllGenerationJobsForUser(userId: number) {
@@ -1185,6 +1321,7 @@ function cancelAllGenerationJobsForUser(userId: number) {
     SET status = 'error', error = '任务已取消', finished_at = ?, updated_at = ?
     WHERE user_id = ? AND status IN ('queued', 'running')
   `).run(now(), now(), userId)
+  if (rows.length) logInfo('generation_jobs_cancelled_for_user', { userId, jobCount: rows.length })
 }
 
 function scheduleGenerationWorker() {
@@ -1228,12 +1365,35 @@ async function executeGenerationJob(job: GenerationJobRow) {
     return
   }
   patchTask(job.user_id, job.task_id, { status: 'running', startedAt, error: null })
+  logInfo('generation_job_started', {
+    userId: job.user_id,
+    taskId: job.task_id,
+    jobId: job.id,
+    activeGenerationJobs,
+  })
 
   try {
     assertGenerationJobActive(job.user_id, job.id)
     const request = parseJson<GenerationRequest>(job.request_json, {} as GenerationRequest)
+    logDebug('generation_job_request_loaded', {
+      userId: job.user_id,
+      taskId: job.task_id,
+      jobId: job.id,
+      profile: summarizeProfile(request.profile),
+      inputImageCount: request.inputImageIds?.length ?? 0,
+      hasMask: Boolean(request.maskImageId),
+      requestedImages: taskParams(request.params).n,
+    })
     const result = await executeGenerationRequest(job.user_id, request, activeJob.controller.signal)
     assertGenerationJobActive(job.user_id, job.id)
+    logInfo('generation_job_provider_result', {
+      userId: job.user_id,
+      taskId: job.task_id,
+      jobId: job.id,
+      imageCount: result.images.length,
+      rawImageUrlCount: result.rawImageUrls?.length ?? 0,
+      hasRawResponsePayload: Boolean(result.rawResponsePayload),
+    })
     if (!result.images.length) {
       const error = result.rawResponsePayload
         ? '接口未返回可识别的图片数据，请查看原始响应内容确认服务商实际返回的数据结构。'
@@ -1242,9 +1402,12 @@ async function executeGenerationJob(job: GenerationJobRow) {
     }
 
     const outputIds: string[] = []
+    const outputFilePaths: string[] = []
     for (const image of result.images) {
       assertGenerationJobActive(job.user_id, job.id)
-      outputIds.push(await storeGeneratedImage(job.user_id, image))
+      const stored = await storeGeneratedImage(job.user_id, image)
+      outputIds.push(stored.id)
+      outputFilePaths.push(stored.filePath)
     }
     assertGenerationJobActive(job.user_id, job.id)
     const finishedAt = now()
@@ -1271,6 +1434,16 @@ async function executeGenerationJob(job: GenerationJobRow) {
       SET status = 'done', finished_at = ?, error = NULL, updated_at = ?
       WHERE user_id = ? AND id = ?
     `).run(finishedAt, finishedAt, job.user_id, job.id)
+    logInfo('generation_job_completed', {
+      userId: job.user_id,
+      taskId: job.task_id,
+      jobId: job.id,
+      outputImageCount: outputIds.length,
+      outputImageIds: outputIds,
+      outputFilePaths,
+      rawImageUrlCount: result.rawImageUrls?.length ?? 0,
+      elapsedMs: Math.max(0, finishedAt - startedAt),
+    })
   } catch (err) {
     const finishedAt = now()
     const isCancelled = activeJob.cancelled || (err instanceof DOMException && err.name === 'AbortError')
@@ -1290,6 +1463,17 @@ async function executeGenerationJob(job: GenerationJobRow) {
       SET status = 'error', finished_at = ?, error = ?, updated_at = ?
       WHERE user_id = ? AND id = ?
     `).run(finishedAt, message, finishedAt, job.user_id, job.id)
+    const fields = {
+      userId: job.user_id,
+      taskId: job.task_id,
+      jobId: job.id,
+      cancelled: isCancelled,
+      elapsedMs: Math.max(0, finishedAt - startedAt),
+      message,
+      error: serializeErrorForLog(err),
+    }
+    if (isCancelled) logInfo('generation_job_cancelled', fields)
+    else logError('generation_job_failed', fields)
   } finally {
     activeGenerationJobRegistry.delete(generationJobKey(job.user_id, job.id))
   }
@@ -1350,9 +1534,26 @@ async function executeFalImageApi(userId: number, request: GenerationRequest, si
   }
   const { input, endpoint, params } = createFalInput(body)
   if (signal?.aborted) throw new DOMException('任务已取消', 'AbortError')
+  const startedAt = now()
+  logInfo('fal_request_started', {
+    userId,
+    endpoint,
+    profile: summarizeProfile(profile),
+    inputImageCount: Array.isArray(body.inputImageDataUrls) ? body.inputImageDataUrls.length : 0,
+    requestedImages: taskParams(request.params).n,
+  })
   const result = await (fal as any).subscribe(endpoint, { input, logs: true })
   if (signal?.aborted) throw new DOMException('任务已取消', 'AbortError')
-  return parseFalResult(result.data as JsonRecord, params)
+  const parsed = await parseFalResult(result.data as JsonRecord, params)
+  logInfo('fal_request_completed', {
+    userId,
+    endpoint,
+    profile: summarizeProfile(profile),
+    imageCount: parsed.images.length,
+    rawImageUrlCount: parsed.rawImageUrls?.length ?? 0,
+    elapsedMs: now() - startedAt,
+  })
+  return parsed
 }
 
 function normalizeImageApiPayload(value: unknown): JsonRecord {
@@ -1465,22 +1666,53 @@ function createResponsesImageTool(params: TaskParams, isEdit: boolean, profile: 
 }
 
 async function providerJsonRequest(profile: ApiProfile, path: string, body?: unknown, method = 'POST', signal?: AbortSignal) {
-  const response = await fetch(buildProviderUrl(profile, path), {
+  const startedAt = now()
+  const providerUrl = buildProviderUrl(profile, path)
+  logInfo('provider_json_request_started', {
+    method,
+    profile: summarizeProfile(profile),
+    ...providerUrlLogFields(providerUrl),
+    hasBody: body !== undefined,
+  })
+  const response = await fetch(providerUrl, {
     method,
     headers: providerHeaders(profile, method === 'GET' || body === undefined ? undefined : 'application/json'),
     body: method === 'GET' || body === undefined ? undefined : JSON.stringify(body),
     signal,
+  })
+  logInfo('provider_json_request_completed', {
+    method,
+    profile: summarizeProfile(profile),
+    ...providerUrlLogFields(providerUrl),
+    status: response.status,
+    ok: response.ok,
+    elapsedMs: now() - startedAt,
   })
   if (!response.ok) throw new Error(await response.text() || `HTTP ${response.status}`)
   return response.json()
 }
 
 async function providerMultipartRequest(profile: ApiProfile, path: string, body: FormData, method = 'POST', signal?: AbortSignal) {
-  const response = await fetch(buildProviderUrl(profile, path), {
+  const startedAt = now()
+  const providerUrl = buildProviderUrl(profile, path)
+  logInfo('provider_multipart_request_started', {
+    method,
+    profile: summarizeProfile(profile),
+    ...providerUrlLogFields(providerUrl),
+  })
+  const response = await fetch(providerUrl, {
     method,
     headers: providerHeaders(profile),
     body: method === 'GET' ? undefined : body,
     signal,
+  })
+  logInfo('provider_multipart_request_completed', {
+    method,
+    profile: summarizeProfile(profile),
+    ...providerUrlLogFields(providerUrl),
+    status: response.status,
+    ok: response.ok,
+    elapsedMs: now() - startedAt,
   })
   if (!response.ok) throw new Error(await response.text() || `HTTP ${response.status}`)
   return response.json()
@@ -1660,6 +1892,12 @@ async function pollCustomTaskResult(profile: ApiProfile, poll: CustomProviderPol
     const taskPath = appendQuery(buildTaskPath(poll.path, taskId), renderQuery(poll.query, context))
     const payload = await providerJsonRequest(profile, taskPath, undefined, poll.method ?? 'GET', signal)
     const state = getTaskState(payload, poll)
+    logInfo('custom_provider_task_poll', {
+      profile: summarizeProfile(profile),
+      taskId,
+      attempts,
+      state,
+    })
     if (state === 'failure') {
       const message = getByPath(payload, poll.errorPath) || getByPath(payload, 'message') || getByPath(payload, 'error.message')
       throw new Error(typeof message === 'string' && message.trim() ? message : '异步任务失败')
@@ -1691,6 +1929,11 @@ async function executeCustomHttpImageApi(
   const taskId = typeof taskIdValue === 'string' ? taskIdValue.trim() : String(taskIdValue ?? '').trim()
   if (!taskId) return extractCustomImages(payload, mapping.result, opts.params)
   if (!customProvider.poll) throw new Error('异步接口返回了 task_id，但服务商配置缺少 poll')
+  logInfo('custom_provider_task_enqueued', {
+    profile: summarizeProfile(profile),
+    provider: customProvider.id,
+    taskId,
+  })
   return pollCustomTaskResult(profile, customProvider.poll, taskId, opts.params, signal)
 }
 
@@ -1706,10 +1949,28 @@ async function handleProviderJson(req: IncomingMessage, res: ServerResponse, use
   const body = await readJsonBody<JsonRecord>(req)
   const profile = resolveProfileForUser(user.id, body.profile)
   const method = asString(body.method, 'POST').toUpperCase()
-  const providerResponse = await fetch(buildProviderUrl(profile, asString(body.path)), {
+  const providerUrl = buildProviderUrl(profile, asString(body.path))
+  const startedAt = now()
+  logInfo('proxy_provider_json_started', {
+    userId: user.id,
+    method,
+    profile: summarizeProfile(profile),
+    ...providerUrlLogFields(providerUrl),
+    hasBody: body.body !== undefined,
+  })
+  const providerResponse = await fetch(providerUrl, {
     method,
     headers: providerHeaders(profile, method === 'GET' || body.body === undefined ? undefined : 'application/json'),
     body: method === 'GET' || body.body === undefined ? undefined : JSON.stringify(body.body),
+  })
+  logInfo('proxy_provider_json_completed', {
+    userId: user.id,
+    method,
+    profile: summarizeProfile(profile),
+    ...providerUrlLogFields(providerUrl),
+    status: providerResponse.status,
+    ok: providerResponse.ok,
+    elapsedMs: now() - startedAt,
   })
   await pipeFetchResponse(providerResponse, res)
 }
@@ -1721,10 +1982,28 @@ async function handleProviderMultipart(req: IncomingMessage, res: ServerResponse
   const path = asString(req.headers['x-gip-provider-path'])
   const method = asString(req.headers['x-gip-provider-method'], 'POST').toUpperCase()
   const contentType = asString(req.headers['content-type'])
-  const providerResponse = await fetch(buildProviderUrl(profile, path), {
+  const providerUrl = buildProviderUrl(profile, path)
+  const startedAt = now()
+  logInfo('proxy_provider_multipart_started', {
+    userId: user.id,
+    method,
+    profile: summarizeProfile(profile),
+    ...providerUrlLogFields(providerUrl),
+    bodyBytes: rawBody.length,
+  })
+  const providerResponse = await fetch(providerUrl, {
     method,
     headers: providerHeaders(profile, contentType),
     body: method === 'GET' ? undefined : new Uint8Array(rawBody),
+  })
+  logInfo('proxy_provider_multipart_completed', {
+    userId: user.id,
+    method,
+    profile: summarizeProfile(profile),
+    ...providerUrlLogFields(providerUrl),
+    status: providerResponse.status,
+    ok: providerResponse.ok,
+    elapsedMs: now() - startedAt,
   })
   await pipeFetchResponse(providerResponse, res)
 }
@@ -1794,6 +2073,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL) {
   if (pathname === '/api/tasks') {
     if (req.method === 'GET') return sendJson(res, 200, listTasksPage(user.id, url))
     if (req.method === 'DELETE') {
+      logInfo('tasks_clear_requested', { userId: user.id })
       cancelAllGenerationJobsForUser(user.id)
       clearJsonRows('tasks', user.id)
       db.prepare('DELETE FROM generation_jobs WHERE user_id = ?').run(user.id)
@@ -1822,6 +2102,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL) {
       return sendJson(res, 200, { id })
     }
     if (req.method === 'DELETE') {
+      logInfo('task_delete_requested', { userId: user.id, taskId: id })
       cancelGenerationJobsForTask(user.id, id)
       deleteJsonRow('tasks', user.id, id)
       db.prepare('DELETE FROM generation_jobs WHERE user_id = ? AND task_id = ?').run(user.id, id)
@@ -1834,6 +2115,19 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL) {
     const body = await readJsonBody<JsonRecord>(req)
     if (!isRecord(body.task)) throw Object.assign(new Error('缺少 task'), { statusCode: 400 })
     if (!isRecord(body.request)) throw Object.assign(new Error('缺少 request'), { statusCode: 400 })
+    const task = body.task
+    const request = body.request as GenerationRequest
+    logInfo('generation_task_create_requested', {
+      userId: user.id,
+      taskId: asString(task.id),
+      batchGroupId: asString(task.batchGroupId) || undefined,
+      batchIndex: asNumber(task.batchIndex, -1) >= 0 ? asNumber(task.batchIndex) : undefined,
+      batchSize: asNumber(task.batchSize) || undefined,
+      profile: summarizeProfile(request.profile),
+      inputImageCount: request.inputImageIds?.length ?? 0,
+      hasMask: Boolean(request.maskImageId),
+      requestedImages: taskParams(request.params).n,
+    })
     return sendJson(res, 200, { task: enqueueGenerationTask(user.id, body.task, body.request as GenerationRequest) })
   }
 
@@ -1885,7 +2179,8 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL) {
     const body = await readJsonBody<JsonRecord>(req)
     const dataUrl = asString(body.dataUrl)
     if (!dataUrl) throw Object.assign(new Error('缺少图片数据'), { statusCode: 400 })
-    const id = createHash('sha256').update(dataUrl).digest('hex')
+    const source = normalizeStoredImageSource(body.source)
+    const id = createStoredImageId(dataUrl, source)
     const existing = getStoredFile('images', user.id, id)
     const createdAt = asNumber(body.createdAt, now())
     const thumbnail = isRecord(body.thumbnail) ? body.thumbnail : null
@@ -1898,7 +2193,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL) {
         id,
         dataUrl,
         createdAt,
-        source: asString(body.source, 'upload'),
+        source,
         width: asNumber(body.width),
         height: asNumber(body.height),
       }, 'dataUrl')
@@ -2012,8 +2307,24 @@ rmSync(join(dataDir, 'tmp'), { recursive: true, force: true })
 scheduleGenerationWorker()
 
 const server = createServer((req, res) => {
+  const startedAt = now()
+  const requestId = genId('req_')
   void (async () => {
     const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`)
+    logInfo('request_started', {
+      requestId,
+      method: req.method,
+      path: url.pathname,
+    })
+    res.once('finish', () => {
+      logInfo('request_completed', {
+        requestId,
+        method: req.method,
+        path: url.pathname,
+        statusCode: res.statusCode,
+        elapsedMs: now() - startedAt,
+      })
+    })
     if (url.pathname.startsWith('/api/')) {
       await handleApi(req, res, url)
       return
@@ -2027,5 +2338,12 @@ const server = createServer((req, res) => {
 
 const port = Number(process.env.PORT || 3000)
 server.listen(port, () => {
-  console.log(`[server] GPT Image Playground listening on http://localhost:${port}`)
+  logInfo('server_listening', {
+    port,
+    dataDir,
+    dbPath,
+    generationConcurrency: GENERATION_CONCURRENCY,
+    customPollTimeoutSeconds: CUSTOM_POLL_TIMEOUT_SECONDS,
+    logLevel: LOG_LEVEL,
+  })
 })

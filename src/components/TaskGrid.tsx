@@ -1,5 +1,5 @@
 import { useMemo, useRef, useState, useEffect } from 'react'
-import { useStore, reuseConfig, editOutputs, removeTask, loadMoreTasksFromServer, loadBatchTasksFromServer } from '../store'
+import { useStore, reuseConfig, editOutputs, removeTask, removeMultipleTasks, loadMoreTasksFromServer, loadBatchTasksFromServer } from '../store'
 import type { TaskRecord } from '../types'
 import TaskCard from './TaskCard'
 import BatchTaskCard from './BatchTaskCard'
@@ -62,13 +62,19 @@ export default function TaskGrid() {
   }, [tasks])
   const visibleTaskIds = useMemo(() => visibleItems.flatMap((item) => item.type === 'task' ? [item.task.id] : item.tasks.map((task) => task.id)), [visibleItems])
 
+  const openBatchGroupIdRef = useRef<string | null>(null)
+
+  useEffect(() => {
+    openBatchGroupIdRef.current = openBatchGroupId
+  }, [openBatchGroupId])
+
   const loadCompleteBatch = (groupId: string) => {
     if (batchLoadsInFlight.current.has(groupId)) return
     batchLoadsInFlight.current.add(groupId)
     void loadBatchTasksFromServer(groupId)
       .then((batchTasks) => {
         setLoadedBatchTasks((current) => ({ ...current, [groupId]: batchTasks }))
-        setOpenBatchTasks((current) => openBatchGroupId === groupId ? batchTasks : current)
+        setOpenBatchTasks((current) => openBatchGroupIdRef.current === groupId ? batchTasks : current)
       })
       .finally(() => {
         batchLoadsInFlight.current.delete(groupId)
@@ -78,6 +84,7 @@ export default function TaskGrid() {
 
   const openBatch = (groupId: string, fallbackTasks: TaskRecord[]) => {
     const completeTasks = loadedBatchTasks[groupId] ?? fallbackTasks
+    openBatchGroupIdRef.current = groupId
     setOpenBatchGroupId(groupId)
     setOpenBatchTasks(completeTasks)
     if (!loadedBatchTasks[groupId]) {
@@ -104,8 +111,64 @@ export default function TaskGrid() {
     setConfirmDialog({
       title: '删除记录',
       message: '确定要删除这条记录吗？关联的图片资源也会被清理（如果没有其他任务引用）。',
-      action: () => removeTask(task),
+      action: () => {
+        void removeTask(task).then(() => {
+          setOpenBatchTasks((current) => current.filter((item) => item.id !== task.id))
+          setLoadedBatchTasks((current) => {
+            if (!task.batchGroupId || !current[task.batchGroupId]) return current
+            return {
+              ...current,
+              [task.batchGroupId]: current[task.batchGroupId].filter((item) => item.id !== task.id),
+            }
+          })
+        })
+      },
     })
+  }
+
+  const handleDeleteBatch = (groupId: string, fallbackTasks: TaskRecord[]) => {
+    void (async () => {
+      let batchTasks = loadedBatchTasks[groupId] ?? fallbackTasks
+      const expectedSize = batchTasks[0]?.batchSize ?? fallbackTasks[0]?.batchSize
+      if (!loadedBatchTasks[groupId] || (expectedSize && batchTasks.length < expectedSize)) {
+        setBatchLoadingGroupId(groupId)
+        try {
+          const completeTasks = await loadBatchTasksFromServer(groupId)
+          if (completeTasks.length) {
+            batchTasks = completeTasks
+            setLoadedBatchTasks((current) => ({ ...current, [groupId]: completeTasks }))
+            if (openBatchGroupIdRef.current === groupId) setOpenBatchTasks(completeTasks)
+          }
+        } catch (error) {
+          useStore.getState().showToast(`无法加载完整批量任务：${error instanceof Error ? error.message : String(error)}`, 'error')
+          return
+        } finally {
+          setBatchLoadingGroupId((current) => current === groupId ? null : current)
+        }
+      }
+
+      const taskIds = batchTasks.map((task) => task.id)
+      if (!taskIds.length) return
+      const incompleteCount = batchTasks.filter((task) => task.status === 'queued' || task.status === 'running').length
+      setConfirmDialog({
+        title: '删除批量任务',
+        message: `确定要删除这个批量任务的 ${taskIds.length} 条记录吗？关联的图片资源也会被清理（如果没有其他任务引用）。${incompleteCount ? `\n其中 ${incompleteCount} 条仍在排队或生成中，删除会取消对应后端任务。` : ''}`,
+        action: () => {
+          void removeMultipleTasks(taskIds).then(() => {
+            setLoadedBatchTasks((current) => {
+              const next = { ...current }
+              delete next[groupId]
+              return next
+            })
+            if (openBatchGroupIdRef.current === groupId) {
+              openBatchGroupIdRef.current = null
+              setOpenBatchGroupId(null)
+              setOpenBatchTasks([])
+            }
+          })
+        },
+      })
+    })()
   }
 
   const getPagePoint = (clientX: number, clientY: number) => ({
@@ -363,6 +426,7 @@ export default function TaskGrid() {
                 <BatchTaskCard
                   tasks={batchTasks}
                   isSelected={selected}
+                  onDelete={() => handleDeleteBatch(item.groupId, batchTasks)}
                   onClick={(e) => {
                     if (Date.now() < suppressClickUntil.current) {
                       e.preventDefault()
@@ -418,6 +482,7 @@ export default function TaskGrid() {
           loading={batchLoadingGroupId === openBatchGroupId}
           selectedTaskIds={selectedTaskIds}
           onClose={() => {
+            openBatchGroupIdRef.current = null
             setOpenBatchGroupId(null)
             setOpenBatchTasks([])
           }}

@@ -405,6 +405,53 @@ function normalizeStringArray(value: unknown): string[] {
   return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : []
 }
 
+async function materializeInputImages(images: InputImage[]) {
+  const materialized: InputImage[] = []
+  const equivalentImageIds: Record<string, string> = {}
+
+  for (const image of images) {
+    const id = await storeImage(image.dataUrl, 'upload')
+    cacheImage(id, image.dataUrl)
+    const nextImage = id === image.id ? image : { ...image, id }
+    materialized.push(nextImage)
+    if (id !== image.id) equivalentImageIds[image.id] = id
+  }
+
+  return {
+    images: materialized,
+    equivalentImageIds,
+  }
+}
+
+async function materializeInputImageIds(imageIds: string[]) {
+  const inputImageIds: string[] = []
+  const inputImages: InputImage[] = []
+  const equivalentImageIds: Record<string, string> = {}
+
+  for (const imageId of imageIds) {
+    const dataUrl = await ensureImageCached(imageId)
+    if (!dataUrl) {
+      inputImageIds.push(imageId)
+      continue
+    }
+    const inputId = await storeImage(dataUrl, 'upload')
+    cacheImage(inputId, dataUrl)
+    inputImageIds.push(inputId)
+    inputImages.push({ id: inputId, dataUrl })
+    if (inputId !== imageId) equivalentImageIds[imageId] = inputId
+  }
+
+  return {
+    inputImageIds,
+    inputImages,
+    equivalentImageIds,
+  }
+}
+
+function remapImageId(id: string | null | undefined, equivalentImageIds: Record<string, string>) {
+  return id ? equivalentImageIds[id] ?? id : id ?? null
+}
+
 function normalizeAgentRound(value: unknown, fallbackIndex: number): AgentRound | null {
   if (!value || typeof value !== 'object') return null
   const round = value as Partial<AgentRound>
@@ -1264,13 +1311,19 @@ export const useStore = create<AppState>()(
         }),
       setInputImages: (imgs, options) =>
         set((s) => {
-          const inputImages = orderImagesWithMaskFirst(imgs, s.maskDraft?.targetImageId)
+          const nextMaskTargetImageId = remapImageId(s.maskDraft?.targetImageId ?? null, options?.equivalentImageIds ?? {})
+          const nextMaskDraft: MaskDraft | null = s.maskDraft && nextMaskTargetImageId
+            ? nextMaskTargetImageId !== s.maskDraft.targetImageId
+              ? { ...s.maskDraft, targetImageId: nextMaskTargetImageId }
+              : s.maskDraft
+            : null
+          const inputImages = orderImagesWithMaskFirst(imgs, nextMaskTargetImageId)
           const shouldClearMask =
-            Boolean(s.maskDraft) && !inputImages.some((img) => img.id === s.maskDraft?.targetImageId)
+            Boolean(nextMaskDraft) && !inputImages.some((img) => img.id === nextMaskDraft?.targetImageId)
           return syncActiveInputDraft(s, {
             inputImages,
             prompt: remapImageMentionsForOrder(s.prompt, s.inputImages, inputImages, options?.equivalentImageIds),
-            ...(shouldClearMask ? { maskDraft: null, maskEditorImageId: null } : {}),
+            ...(shouldClearMask ? { maskDraft: null, maskEditorImageId: null } : { maskDraft: nextMaskDraft }),
           })
         }),
       moveInputImage: (fromIdx, toIdx) =>
@@ -2469,9 +2522,14 @@ export async function submitTask(options: { allowFullMask?: boolean; useCurrentA
     }
   }
 
-  // 持久化输入图片到 IndexedDB（此前只在内存缓存中）
-  for (const img of orderedInputImages) {
-    await storeImage(img.dataUrl)
+  // 输入图像使用独立的输入命名空间，避免直接复用输出图像 ID。
+  const inputMaterialization = await materializeInputImages(orderedInputImages)
+  if (Object.keys(inputMaterialization.equivalentImageIds).length) {
+    orderedInputImages = inputMaterialization.images
+    maskTargetImageId = remapImageId(maskTargetImageId, inputMaterialization.equivalentImageIds)
+    useStore.getState().setInputImages(orderedInputImages, {
+      equivalentImageIds: inputMaterialization.equivalentImageIds,
+    })
   }
 
   const normalizedParams = normalizeParamsForSettings(params, requestSettings, { hasInputImages: orderedInputImages.length > 0 })
@@ -3288,11 +3346,15 @@ export async function submitAgentMessage() {
     }
   }
 
-  const inputImageIds = uniqueIds(orderedInputImages.map((image) => image.id))
-
-  for (const image of orderedInputImages) {
-    await storeImage(image.dataUrl)
+  const inputMaterialization = await materializeInputImages(orderedInputImages)
+  if (Object.keys(inputMaterialization.equivalentImageIds).length) {
+    orderedInputImages = inputMaterialization.images
+    maskTargetImageId = remapImageId(maskTargetImageId, inputMaterialization.equivalentImageIds)
+    state.setInputImages(orderedInputImages, {
+      equivalentImageIds: inputMaterialization.equivalentImageIds,
+    })
   }
+  const inputImageIds = uniqueIds(orderedInputImages.map((image) => image.id))
 
   const requestSettings = createSettingsForApiProfile(normalizedSettings, activeProfile)
   const now = Date.now()
@@ -3673,8 +3735,10 @@ async function executeAgentRound(
             if (currentRefId === refId) {
               const imageId = r.inputImageIds[imgIdx]
               const dataUrl = await ensureImageCached(imageId)
-              if (dataUrl) dataUrls.push(dataUrl)
-              imageIds.push(imageId)
+              if (dataUrl) {
+                dataUrls.push(dataUrl)
+                imageIds.push(imageId)
+              }
             }
           }
           const outputImages = collectAgentRoundOutputImageSlots(r, useStore.getState().tasks)
@@ -3684,13 +3748,20 @@ async function executeAgentRound(
               const imageId = outputImages[imgIdx]
               if (!imageId) continue
               const dataUrl = await ensureImageCached(imageId)
-              if (dataUrl) dataUrls.push(dataUrl)
-              imageIds.push(imageId)
+              if (dataUrl) {
+                dataUrls.push(dataUrl)
+                imageIds.push(imageId)
+              }
             }
           }
         }
       }
-      return { dataUrls, imageIds }
+      const inputImages = imageIds.map((id, index) => ({ id, dataUrl: dataUrls[index] })).filter((image) => Boolean(image.dataUrl))
+      const materialized = await materializeInputImages(inputImages)
+      return {
+        dataUrls: materialized.images.map((image) => image.dataUrl),
+        imageIds: materialized.images.map((image) => image.id),
+      }
     }
 
     // Helper: execute a generate_image_batch function call concurrently
@@ -4327,7 +4398,9 @@ export function updateTaskInStore(taskId: string, patch: Partial<TaskRecord>) {
 export async function retryTask(task: TaskRecord) {
   const { settings } = useStore.getState()
   const activeProfile = getActiveApiProfile(settings)
-  const normalizedParams = normalizeParamsForSettings(task.params, settings, { hasInputImages: task.inputImageIds.length > 0 })
+  const materializedInputs = await materializeInputImageIds(task.inputImageIds)
+  const inputImageIds = materializedInputs.inputImageIds
+  const normalizedParams = normalizeParamsForSettings(task.params, settings, { hasInputImages: inputImageIds.length > 0 })
   const taskId = genId()
   const newTask: TaskRecord = {
     id: taskId,
@@ -4338,8 +4411,8 @@ export async function retryTask(task: TaskRecord) {
     apiProfileName: activeProfile.name,
     apiMode: activeProfile.apiMode,
     apiModel: activeProfile.model,
-    inputImageIds: [...task.inputImageIds],
-    maskTargetImageId: task.maskTargetImageId ?? null,
+    inputImageIds,
+    maskTargetImageId: remapImageId(task.maskTargetImageId, materializedInputs.equivalentImageIds),
     maskImageId: task.maskImageId ?? null,
     outputImages: [],
     status: 'queued',
@@ -4383,15 +4456,20 @@ export async function reuseConfig(task: TaskRecord) {
 
   // 恢复输入图片
   const imgs: InputImage[] = []
+  const equivalentImageIds: Record<string, string> = {}
   for (const imgId of task.inputImageIds) {
     const dataUrl = await ensureImageCached(imgId)
     if (dataUrl) {
-      imgs.push({ id: imgId, dataUrl })
+      const inputId = await storeImage(dataUrl, 'upload')
+      cacheImage(inputId, dataUrl)
+      imgs.push({ id: inputId, dataUrl })
+      if (inputId !== imgId) equivalentImageIds[imgId] = inputId
     }
   }
-  setInputImages(imgs)
+  setInputImages(imgs, { equivalentImageIds })
   setPrompt(task.prompt)
-  const maskTargetImageId = task.maskTargetImageId ?? (task.maskImageId ? task.inputImageIds[0] : null)
+  const originalMaskTargetImageId = task.maskTargetImageId ?? (task.maskImageId ? task.inputImageIds[0] : null)
+  const maskTargetImageId = remapImageId(originalMaskTargetImageId, equivalentImageIds)
   if (maskTargetImageId && task.maskImageId && imgs.some((img) => img.id === maskTargetImageId)) {
     const maskDataUrl = await ensureImageCached(task.maskImageId)
     if (maskDataUrl) {
@@ -4433,11 +4511,15 @@ export async function editOutputs(task: TaskRecord) {
   if (!task.outputImages?.length) return
 
   let added = 0
+  const existingInputIds = new Set(inputImages.map((image) => image.id))
   for (const imgId of task.outputImages) {
-    if (inputImages.find((i) => i.id === imgId)) continue
     const dataUrl = await ensureImageCached(imgId)
     if (dataUrl) {
-      addInputImage({ id: imgId, dataUrl })
+      const inputId = await storeImage(dataUrl, 'upload')
+      if (existingInputIds.has(inputId)) continue
+      existingInputIds.add(inputId)
+      cacheImage(inputId, dataUrl)
+      addInputImage({ id: inputId, dataUrl })
       added++
     }
   }
