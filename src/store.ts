@@ -1823,7 +1823,7 @@ function scheduleTaskPollingIfNeeded() {
 async function enqueueGenerationTask(task: TaskRecord, request: GenerationRequest) {
   const response = await backendGeneration.createTask(getPersistableTask(task), request)
   const queuedTask = response.task
-  useStore.setState((state) => ({ tasks: mergeTasksById(state.tasks, [queuedTask]) }))
+  useStore.setState((state) => ({ tasks: reconcileTasksForCurrentFilters(state.tasks, [queuedTask]) }))
   scheduleTaskPollingIfNeeded()
   return queuedTask
 }

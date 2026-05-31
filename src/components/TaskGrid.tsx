@@ -22,7 +22,9 @@ export default function TaskGrid() {
   const [selectionBox, setSelectionBox] = useState<{ startPageX: number; startPageY: number; currentPageX: number; currentPageY: number } | null>(null)
   const [openBatchGroupId, setOpenBatchGroupId] = useState<string | null>(null)
   const [openBatchTasks, setOpenBatchTasks] = useState<TaskRecord[]>([])
+  const [loadedBatchTasks, setLoadedBatchTasks] = useState<Record<string, TaskRecord[]>>({})
   const [batchLoadingGroupId, setBatchLoadingGroupId] = useState<string | null>(null)
+  const batchLoadsInFlight = useRef<Set<string>>(new Set())
   const dragStart = useRef<{ pageX: number; pageY: number } | null>(null)
   const lastClientPoint = useRef<{ x: number; y: number } | null>(null)
   const hasDragged = useRef(false)
@@ -60,18 +62,43 @@ export default function TaskGrid() {
   }, [tasks])
   const visibleTaskIds = useMemo(() => visibleItems.flatMap((item) => item.type === 'task' ? [item.task.id] : item.tasks.map((task) => task.id)), [visibleItems])
 
-  const openBatch = (groupId: string, fallbackTasks: TaskRecord[]) => {
-    setOpenBatchGroupId(groupId)
-    setOpenBatchTasks(fallbackTasks)
-    setBatchLoadingGroupId(groupId)
+  const loadCompleteBatch = (groupId: string) => {
+    if (batchLoadsInFlight.current.has(groupId)) return
+    batchLoadsInFlight.current.add(groupId)
     void loadBatchTasksFromServer(groupId)
       .then((batchTasks) => {
-        if (useStore.getState().tasks.some((task) => task.batchGroupId === groupId)) {
-          setOpenBatchTasks(batchTasks)
-        }
+        setLoadedBatchTasks((current) => ({ ...current, [groupId]: batchTasks }))
+        setOpenBatchTasks((current) => openBatchGroupId === groupId ? batchTasks : current)
       })
-      .finally(() => setBatchLoadingGroupId((current) => current === groupId ? null : current))
+      .finally(() => {
+        batchLoadsInFlight.current.delete(groupId)
+        setBatchLoadingGroupId((current) => current === groupId ? null : current)
+      })
   }
+
+  const openBatch = (groupId: string, fallbackTasks: TaskRecord[]) => {
+    const completeTasks = loadedBatchTasks[groupId] ?? fallbackTasks
+    setOpenBatchGroupId(groupId)
+    setOpenBatchTasks(completeTasks)
+    if (!loadedBatchTasks[groupId]) {
+      setBatchLoadingGroupId(groupId)
+      loadCompleteBatch(groupId)
+    }
+  }
+
+  useEffect(() => {
+    for (const item of visibleItems) {
+      if (item.type !== 'batch') continue
+      const expectedSize = item.tasks[0]?.batchSize
+      const loaded = loadedBatchTasks[item.groupId]
+      if (loaded) continue
+      if (expectedSize && item.tasks.length >= expectedSize) {
+        setLoadedBatchTasks((current) => ({ ...current, [item.groupId]: item.tasks }))
+        continue
+      }
+      loadCompleteBatch(item.groupId)
+    }
+  }, [visibleItems, loadedBatchTasks])
 
   const handleDelete = (task: typeof tasks[0]) => {
     setConfirmDialog({
@@ -324,15 +351,17 @@ export default function TaskGrid() {
       <div ref={gridRef} className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4 pb-10">
         {visibleItems.map((item) => {
           if (item.type === 'batch') {
-            const selected = item.tasks.some((task) => selectedTaskIds.includes(task.id))
+            const batchTasks = loadedBatchTasks[item.groupId] ?? item.tasks
+            const batchTaskIds = batchTasks.map((task) => task.id)
+            const selected = batchTaskIds.some((id) => selectedTaskIds.includes(id))
             return (
               <div
                 key={item.groupId}
                 className="task-card-wrapper"
-                data-batch-task-ids={item.tasks.map((task) => task.id).join(',')}
+                data-batch-task-ids={batchTaskIds.join(',')}
               >
                 <BatchTaskCard
-                  tasks={item.tasks}
+                  tasks={batchTasks}
                   isSelected={selected}
                   onClick={(e) => {
                     if (Date.now() < suppressClickUntil.current) {
@@ -342,14 +371,14 @@ export default function TaskGrid() {
                     suppressClickUntil.current = 0
                     const isCtrl = isMac ? e.metaKey : e.ctrlKey
                     if (isCtrl) {
-                      const ids = item.tasks.map((task) => task.id)
-                      const allSelected = ids.every((id) => selectedTaskIds.includes(id))
+                      const ids = batchTaskIds
+                      const allSelected = ids.length > 0 && ids.every((id) => selectedTaskIds.includes(id))
                       useStore.getState().setSelectedTaskIds((current) =>
                         allSelected ? current.filter((id) => !ids.includes(id)) : [...new Set([...current, ...ids])],
                       )
                       return
                     }
-                    openBatch(item.groupId, item.tasks)
+                    openBatch(item.groupId, batchTasks)
                   }}
                 />
               </div>
