@@ -1,5 +1,5 @@
 import { useMemo, useRef, useState, useEffect } from 'react'
-import { useStore, reuseConfig, editOutputs, removeTask, removeMultipleTasks, loadMoreTasksFromServer, loadBatchTasksFromServer } from '../store'
+import { ALL_FAVORITES_COLLECTION_ID, getTaskFavoriteCollectionIds, useStore, reuseConfig, editOutputs, removeTask, removeMultipleTasks, loadMoreTasksFromServer, loadBatchTasksFromServer } from '../store'
 import type { TaskRecord } from '../types'
 import TaskCard from './TaskCard'
 import BatchTaskCard from './BatchTaskCard'
@@ -10,6 +10,7 @@ export default function TaskGrid() {
   const searchQuery = useStore((s) => s.searchQuery)
   const filterStatus = useStore((s) => s.filterStatus)
   const filterFavorite = useStore((s) => s.filterFavorite)
+  const activeFavoriteCollectionId = useStore((s) => s.activeFavoriteCollectionId)
   const setDetailTaskId = useStore((s) => s.setDetailTaskId)
   const setConfirmDialog = useStore((s) => s.setConfirmDialog)
   const selectedTaskIds = useStore((s) => s.selectedTaskIds)
@@ -39,7 +40,22 @@ export default function TaskGrid() {
   const isMac = /Mac|iPod|iPhone|iPad/.test(navigator.platform)
 
   const visibleItems = useMemo(() => {
-    const sorted = [...tasks].sort((a, b) => b.createdAt - a.createdAt)
+    const q = searchQuery.trim().toLowerCase()
+    const sorted = [...tasks]
+      .sort((a, b) => b.createdAt - a.createdAt)
+      .filter((t) => {
+        if (filterFavorite) {
+          if (!t.isFavorite) return false
+          if (activeFavoriteCollectionId && activeFavoriteCollectionId !== ALL_FAVORITES_COLLECTION_ID && !getTaskFavoriteCollectionIds(t).includes(activeFavoriteCollectionId)) return false
+        }
+        const matchStatus = filterStatus === 'all' || t.status === filterStatus
+        if (!matchStatus) return false
+
+        if (!q) return true
+        const prompt = (t.prompt || '').toLowerCase()
+        const paramStr = JSON.stringify(t.params).toLowerCase()
+        return prompt.includes(q) || paramStr.includes(q)
+      })
     const groups = new Map<string, typeof tasks>()
     const items: Array<{ type: 'task'; task: typeof tasks[0] } | { type: 'batch'; groupId: string; tasks: typeof tasks }> = []
     for (const task of sorted) {
@@ -59,7 +75,7 @@ export default function TaskGrid() {
       const bTime = b.type === 'task' ? b.task.createdAt : Math.max(...b.tasks.map((task) => task.createdAt))
       return bTime - aTime
     })
-  }, [tasks])
+  }, [tasks, searchQuery, filterStatus, filterFavorite, activeFavoriteCollectionId])
   const visibleTaskIds = useMemo(() => visibleItems.flatMap((item) => item.type === 'task' ? [item.task.id] : item.tasks.map((task) => task.id)), [visibleItems])
 
   const openBatchGroupIdRef = useRef<string | null>(null)
@@ -382,7 +398,7 @@ export default function TaskGrid() {
     return (
       <div className="text-center py-20 text-gray-400 dark:text-gray-500">
         {searchQuery || filterFavorite || filterStatus !== 'all' ? (
-          <p className="text-sm">没有找到匹配的记录</p>
+          <p className="text-sm">没有找到匹配的任务</p>
         ) : (
           <>
             <svg
