@@ -123,6 +123,41 @@ export default function TaskGrid() {
     }
   }, [visibleItems, loadedBatchTasks])
 
+  // 将 store 中的轮询更新同步到已加载的批量任务缓存和打开的批量弹窗
+  useEffect(() => {
+    const taskById = new Map(tasks.map((t) => [t.id, t]))
+    setLoadedBatchTasks((current) => {
+      let next = current
+      for (const [groupId, batchTasks] of Object.entries(current)) {
+        let updated = batchTasks
+        for (let i = 0; i < updated.length; i++) {
+          const fresh = taskById.get(updated[i].id)
+          if (fresh && fresh !== updated[i]) {
+            if (updated === batchTasks) updated = [...updated]
+            updated[i] = fresh
+          }
+        }
+        if (updated !== batchTasks) {
+          if (next === current) next = { ...current }
+          next[groupId] = updated
+        }
+      }
+      return next
+    })
+    setOpenBatchTasks((current) => {
+      if (!openBatchGroupIdRef.current) return current
+      let updated = current
+      for (let i = 0; i < updated.length; i++) {
+        const fresh = taskById.get(updated[i].id)
+        if (fresh && fresh !== updated[i]) {
+          if (updated === current) updated = [...current]
+          updated[i] = fresh
+        }
+      }
+      return updated
+    })
+  }, [tasks])
+
   const handleDelete = (task: typeof tasks[0]) => {
     setConfirmDialog({
       title: '删除记录',
