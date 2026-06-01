@@ -937,8 +937,12 @@ function buildProviderUrl(profile: ApiProfile, path: string) {
   return url.toString()
 }
 
+const UPSTREAM_USER_AGENT = 'codex_exec/0.134.0 (Debian 12.0.0; x86_64) unknown (codex_exec; 0.134.0)'
+
 function providerHeaders(profile: ApiProfile, contentType?: string) {
-  const headers: Record<string, string> = {}
+  const headers: Record<string, string> = {
+    'User-Agent': UPSTREAM_USER_AGENT,
+  }
   if (profile.apiKey) headers.Authorization = `Bearer ${profile.apiKey}`
   if (contentType) headers['Content-Type'] = contentType
   return headers
@@ -976,7 +980,7 @@ function decodeJsonHeader(value: string) {
 
 async function fetchImageUrlAsDataUrl(url: string, fallbackMime = 'image/png') {
   if (url.startsWith('data:')) return url
-  const response = await fetch(url, { cache: 'no-store' })
+  const response = await fetch(url, { cache: 'no-store', headers: { 'User-Agent': UPSTREAM_USER_AGENT } })
   if (!response.ok) throw new Error(`图片 URL 下载失败：HTTP ${response.status}`)
   const bytes = Buffer.from(await response.arrayBuffer())
   return `data:${response.headers.get('content-type') || fallbackMime};base64,${bytes.toString('base64')}`
