@@ -1636,7 +1636,11 @@ export const useStore = create<AppState>()(
       searchQuery: '',
       setSearchQuery: (searchQuery) => {
         set({ searchQuery })
-        void reloadTasksFromServer()
+        const state = useStore.getState()
+        // 收藏夹概览模式下的搜索仅过滤收藏夹名称，不需要重新加载任务列表
+        if (!(state.filterFavorite && !state.activeFavoriteCollectionId)) {
+          void reloadTasksFromServer()
+        }
       },
       filterStatus: 'all',
       setFilterStatus: (filterStatus) => {
@@ -1649,7 +1653,11 @@ export const useStore = create<AppState>()(
           ? { filterFavorite, selectedTaskIds: [], selectedFavoriteCollectionIds: [] }
           : { filterFavorite, activeFavoriteCollectionId: null, selectedTaskIds: [], selectedFavoriteCollectionIds: [] },
         )
-        void reloadTasksFromServer()
+        if (filterFavorite) {
+          void reloadTasksFromServer().then(() => loadAllFavoritesForOverview())
+        } else {
+          void reloadTasksFromServer()
+        }
       },
 
       // Selection
@@ -1968,6 +1976,19 @@ export async function loadMoreTasksFromServer() {
   } finally {
     useStore.setState({ tasksLoadingMore: false })
   }
+}
+
+async function loadAllFavoritesForOverview() {
+  const allFavorites: TaskRecord[] = []
+  let cursor: string | undefined
+  do {
+    const page = await listTasks({ limit: 100, favorite: true, status: 'all', cursor })
+    allFavorites.push(...page.items)
+    cursor = page.nextCursor
+  } while (cursor)
+  useStore.setState((state) => ({
+    tasks: reconcileTasksForCurrentFilters(state.tasks, allFavorites),
+  }))
 }
 
 async function refreshIncompleteTasks() {
@@ -4595,8 +4616,7 @@ export function getTaskFavoriteCollectionIds(task: TaskRecord) {
 }
 
 function normalizeTaskFavoriteState(task: TaskRecord, collections: FavoriteCollection[]): TaskRecord {
-  const collectionIdSet = new Set(collections.map((collection) => collection.id))
-  const normalizedIds = normalizeFavoriteCollectionIds(task.favoriteCollectionIds).filter((id) => collectionIdSet.has(id))
+  const normalizedIds = normalizeFavoriteCollectionIds(task.favoriteCollectionIds)
   // 旧版本只有 isFavorite 没有 favoriteCollectionIds，迁移到"默认"收藏夹
   const defaultId = getDefaultNamedFavoriteCollectionId(collections)
   const ids = normalizedIds.length > 0 ? normalizedIds : task.isFavorite && defaultId ? [defaultId] : []

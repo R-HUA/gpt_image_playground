@@ -1366,7 +1366,12 @@ function imageIdsFromTask(task: TaskRecord, field: 'outputImages' | 'inputImageI
 }
 
 function remainingTaskUsesImage(tasks: TaskRecord[], imageId: string) {
-  return tasks.some((task) => imageIdsFromTask(task, 'outputImages').includes(imageId))
+  return tasks.some((task) => {
+    if (imageIdsFromTask(task, 'outputImages').includes(imageId)) return true
+    if (imageIdsFromTask(task, 'inputImageIds').includes(imageId)) return true
+    if (task.maskImageId === imageId) return true
+    return false
+  })
 }
 
 function archiveDeletedTaskOutputs(userId: number, task: TaskRecord, remainingTasks: TaskRecord[], options: { deleteUnreferencedOriginals?: boolean } = {}) {
