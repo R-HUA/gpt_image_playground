@@ -1444,6 +1444,81 @@ function archiveDeletedTaskOutputs(userId: number, task: TaskRecord, remainingTa
   return archivedCount
 }
 
+/**
+ * 归档单个图片的所有任务引用。
+ * 返回值：
+ *   - { status: 'no-task' }     图片不是任何任务的输出，无需归档
+ *   - { status: 'ok', count }   成功归档 count 条记录
+ *   - { status: 'failed' }      找到了引用任务但归档失败（磁盘/权限等问题）
+ */
+function archiveSingleDeletedImage(userId: number, imageId: string): { status: 'no-task' | 'ok' | 'failed'; count: number } {
+  const imageRow = getStoredFileRow('images', userId, imageId)
+  if (!imageRow) return { status: 'no-task', count: 0 }
+  const tasks = getActiveTasksForUser(userId)
+  let archivedCount = 0
+  let hasMatch = false
+  let archiveFailed = false
+  for (const task of tasks) {
+    const outputImages = imageIdsFromTask(task, 'outputImages')
+    const index = outputImages.indexOf(imageId)
+    if (index < 0) continue
+    hasMatch = true
+    const archiveId = `${userId}:${safeSegment(task.id)}:${index}:${safeSegment(imageId)}`
+    const archivePath = deletedGeneratedImagePath(userId, task.id, index, imageId, imageRow.mime)
+    const sourcePath = absoluteDataPath(imageRow.file_path)
+    const targetPath = absoluteDataPath(archivePath)
+    const deletedAt = now()
+    try {
+      ensureParentSync(targetPath)
+      copyFileSync(sourcePath, targetPath)
+    } catch (err) {
+      logWarn('single_image_archive_failed', {
+        userId,
+        taskId: task.id,
+        imageId,
+        error: serializeErrorForLog(err),
+      })
+      archiveFailed = true
+      continue
+    }
+    db.prepare(`
+      INSERT INTO deleted_generated_images (
+        id, user_id, task_id, image_id, output_index, mime,
+        archived_file_path, original_file_path, task_json, image_metadata_json,
+        deleted_at, created_at, updated_at
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        mime = excluded.mime,
+        archived_file_path = excluded.archived_file_path,
+        original_file_path = excluded.original_file_path,
+        task_json = excluded.task_json,
+        image_metadata_json = excluded.image_metadata_json,
+        deleted_at = excluded.deleted_at,
+        updated_at = excluded.updated_at
+    `).run(
+      archiveId,
+      userId,
+      task.id,
+      imageId,
+      index,
+      imageRow.mime,
+      archivePath,
+      imageRow.file_path,
+      JSON.stringify(task),
+      imageRow.metadata_json,
+      deletedAt,
+      imageRow.created_at || deletedAt,
+      deletedAt,
+    )
+    logInfo('single_image_archived', { userId, taskId: task.id, imageId })
+    archivedCount += 1
+  }
+  if (!hasMatch) return { status: 'no-task', count: 0 }
+  if (archiveFailed && archivedCount === 0) return { status: 'failed', count: 0 }
+  return { status: 'ok', count: archivedCount }
+}
+
 function deleteTaskRecord(userId: number, taskId: string) {
   const task = getJsonRow<TaskRecord>('tasks', userId, taskId)
   if (!task) return { task: null, archivedCount: 0 }
@@ -2681,6 +2756,10 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL) {
       return sendJson(res, 200, { id })
     }
     if (req.method === 'DELETE') {
+      const archiveResult = archiveSingleDeletedImage(user.id, id)
+      if (archiveResult.status === 'failed') {
+        throw Object.assign(new Error('图片归档失败，已阻止删除'), { statusCode: 500 })
+      }
       deleteStoredFile('images', user.id, id)
       return sendNoContent(res)
     }
@@ -2727,7 +2806,8 @@ async function serveStatic(res: ServerResponse, pathname: string) {
     const fileStat = await stat(filePath)
     if (fileStat.isDirectory()) filePath = join(filePath, 'index.html')
   } catch {
-    filePath = extname(filePath) ? filePath : join(distDir, 'index.html')
+    const fallbackHtml = pathname.startsWith('/admin') ? 'admin.html' : 'index.html'
+    filePath = extname(filePath) ? filePath : join(distDir, fallbackHtml)
   }
 
   try {

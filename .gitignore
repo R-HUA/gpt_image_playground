@@ -5,3 +5,4 @@ data/
 config/users.json
 dev-proxy.config.json
 .wrangler/
+.qoder/
