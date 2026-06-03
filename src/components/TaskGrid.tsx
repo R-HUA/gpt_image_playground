@@ -1,5 +1,5 @@
 import { useMemo, useRef, useState, useEffect } from 'react'
-import { useStore, reuseConfig, editOutputs, removeTask, removeMultipleTasks, loadMoreTasksFromServer, loadBatchTasksFromServer } from '../store'
+import { ALL_FAVORITES_COLLECTION_ID, getTaskFavoriteCollectionIds, useStore, reuseConfig, editOutputs, removeTask, removeMultipleTasks, loadMoreTasksFromServer, loadBatchTasksFromServer } from '../store'
 import type { TaskRecord } from '../types'
 import TaskCard from './TaskCard'
 import BatchTaskCard from './BatchTaskCard'
@@ -10,6 +10,7 @@ export default function TaskGrid() {
   const searchQuery = useStore((s) => s.searchQuery)
   const filterStatus = useStore((s) => s.filterStatus)
   const filterFavorite = useStore((s) => s.filterFavorite)
+  const activeFavoriteCollectionId = useStore((s) => s.activeFavoriteCollectionId)
   const setDetailTaskId = useStore((s) => s.setDetailTaskId)
   const setConfirmDialog = useStore((s) => s.setConfirmDialog)
   const selectedTaskIds = useStore((s) => s.selectedTaskIds)
@@ -39,7 +40,22 @@ export default function TaskGrid() {
   const isMac = /Mac|iPod|iPhone|iPad/.test(navigator.platform)
 
   const visibleItems = useMemo(() => {
-    const sorted = [...tasks].sort((a, b) => b.createdAt - a.createdAt)
+    const q = searchQuery.trim().toLowerCase()
+    const sorted = [...tasks]
+      .sort((a, b) => b.createdAt - a.createdAt)
+      .filter((t) => {
+        if (filterFavorite) {
+          if (!t.isFavorite) return false
+          if (activeFavoriteCollectionId && activeFavoriteCollectionId !== ALL_FAVORITES_COLLECTION_ID && !getTaskFavoriteCollectionIds(t).includes(activeFavoriteCollectionId)) return false
+        }
+        const matchStatus = filterStatus === 'all' || t.status === filterStatus
+        if (!matchStatus) return false
+
+        if (!q) return true
+        const prompt = (t.prompt || '').toLowerCase()
+        const paramStr = JSON.stringify(t.params).toLowerCase()
+        return prompt.includes(q) || paramStr.includes(q)
+      })
     const groups = new Map<string, typeof tasks>()
     const items: Array<{ type: 'task'; task: typeof tasks[0] } | { type: 'batch'; groupId: string; tasks: typeof tasks }> = []
     for (const task of sorted) {
@@ -59,7 +75,7 @@ export default function TaskGrid() {
       const bTime = b.type === 'task' ? b.task.createdAt : Math.max(...b.tasks.map((task) => task.createdAt))
       return bTime - aTime
     })
-  }, [tasks])
+  }, [tasks, searchQuery, filterStatus, filterFavorite, activeFavoriteCollectionId])
   const visibleTaskIds = useMemo(() => visibleItems.flatMap((item) => item.type === 'task' ? [item.task.id] : item.tasks.map((task) => task.id)), [visibleItems])
 
   const openBatchGroupIdRef = useRef<string | null>(null)
@@ -107,10 +123,45 @@ export default function TaskGrid() {
     }
   }, [visibleItems, loadedBatchTasks])
 
+  // 将 store 中的轮询更新同步到已加载的批量任务缓存和打开的批量弹窗
+  useEffect(() => {
+    const taskById = new Map(tasks.map((t) => [t.id, t]))
+    setLoadedBatchTasks((current) => {
+      let next = current
+      for (const [groupId, batchTasks] of Object.entries(current)) {
+        let updated = batchTasks
+        for (let i = 0; i < updated.length; i++) {
+          const fresh = taskById.get(updated[i].id)
+          if (fresh && fresh !== updated[i]) {
+            if (updated === batchTasks) updated = [...updated]
+            updated[i] = fresh
+          }
+        }
+        if (updated !== batchTasks) {
+          if (next === current) next = { ...current }
+          next[groupId] = updated
+        }
+      }
+      return next
+    })
+    setOpenBatchTasks((current) => {
+      if (!openBatchGroupIdRef.current) return current
+      let updated = current
+      for (let i = 0; i < updated.length; i++) {
+        const fresh = taskById.get(updated[i].id)
+        if (fresh && fresh !== updated[i]) {
+          if (updated === current) updated = [...current]
+          updated[i] = fresh
+        }
+      }
+      return updated
+    })
+  }, [tasks])
+
   const handleDelete = (task: typeof tasks[0]) => {
     setConfirmDialog({
       title: '删除记录',
-      message: '确定要删除这条记录吗？关联的图片资源也会被清理（如果没有其他任务引用）。',
+      message: '确定要删除这条记录吗？生成结果会从页面隐藏并归档保留，未被其他内容引用的参考图、遮罩和流式临时图会被清理。',
       action: () => {
         void removeTask(task).then(() => {
           setOpenBatchTasks((current) => current.filter((item) => item.id !== task.id))
@@ -152,7 +203,7 @@ export default function TaskGrid() {
       const incompleteCount = batchTasks.filter((task) => task.status === 'queued' || task.status === 'running').length
       setConfirmDialog({
         title: '删除批量任务',
-        message: `确定要删除这个批量任务的 ${taskIds.length} 条记录吗？关联的图片资源也会被清理（如果没有其他任务引用）。${incompleteCount ? `\n其中 ${incompleteCount} 条仍在排队或生成中，删除会取消对应后端任务。` : ''}`,
+        message: `确定要删除这个批量任务的 ${taskIds.length} 条记录吗？生成结果会从页面隐藏并归档保留，未被其他内容引用的参考图、遮罩和流式临时图会被清理。${incompleteCount ? `\n其中 ${incompleteCount} 条仍在排队或生成中，删除会取消对应后端任务。` : ''}`,
         action: () => {
           void removeMultipleTasks(taskIds).then(() => {
             setLoadedBatchTasks((current) => {
@@ -382,7 +433,7 @@ export default function TaskGrid() {
     return (
       <div className="text-center py-20 text-gray-400 dark:text-gray-500">
         {searchQuery || filterFavorite || filterStatus !== 'all' ? (
-          <p className="text-sm">没有找到匹配的记录</p>
+          <p className="text-sm">没有找到匹配的任务</p>
         ) : (
           <>
             <svg

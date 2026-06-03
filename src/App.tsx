@@ -20,6 +20,7 @@ import Toast from './components/Toast'
 import MaskEditorModal from './components/MaskEditorModal'
 import ImageContextMenu from './components/ImageContextMenu'
 import SupportPromptModal from './components/SupportPromptModal'
+import { FavoriteCollectionPickerModal, FavoriteCollectionsView, ManageCollectionsModal } from './components/FavoriteCollections'
 import { useGlobalClickSuppression } from './lib/clickSuppression'
 
 let customProviderConfigUrlImportStarted = false
@@ -32,6 +33,8 @@ export default function App() {
   const [authUser, setAuthUser] = useState<AuthUser | null>(null)
   const [bootStatus, setBootStatus] = useState<BootStatus>('checking')
   const [bootError, setBootError] = useState('')
+  const filterFavorite = useStore((s) => s.filterFavorite)
+  const activeFavoriteCollectionId = useStore((s) => s.activeFavoriteCollectionId)
   useDockerApiUrlMigrationNotice()
   useGlobalClickSuppression()
 
@@ -155,7 +158,7 @@ export default function App() {
         <main data-home-main data-drag-select-surface className="pb-48">
           <div className="safe-area-x max-w-7xl mx-auto">
             <SearchBar />
-            <TaskGrid />
+            {filterFavorite && !activeFavoriteCollectionId ? <FavoriteCollectionsView /> : <TaskGrid />}
           </div>
         </main>
       )}
@@ -165,6 +168,8 @@ export default function App() {
       <SettingsModal />
       <ConfirmDialog />
       <SupportPromptModal />
+      <FavoriteCollectionPickerModal />
+      <ManageCollectionsModal />
       <Toast />
       <MaskEditorModal />
       <ImageContextMenu />

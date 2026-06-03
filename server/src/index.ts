@@ -1,6 +1,6 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 import { createHmac, randomBytes, scryptSync, timingSafeEqual, createHash } from 'node:crypto'
-import { existsSync, mkdirSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'node:fs'
+import { copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'node:fs'
 import { mkdir, readFile, stat } from 'node:fs/promises'
 import { dirname, extname, join, normalize, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -16,6 +16,7 @@ const REFRESH_TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000
 const DEFAULT_FAL_IMAGE_SIZE = { width: 1360, height: 1024 }
 const GENERATION_CONCURRENCY = Math.max(1, Number.parseInt(process.env.GIP_GENERATION_CONCURRENCY || '1', 10) || 1)
 const CUSTOM_POLL_TIMEOUT_SECONDS = Math.max(1, Number.parseInt(process.env.GIP_CUSTOM_POLL_TIMEOUT_SECONDS || '900', 10) || 900)
+const ADMIN_API_KEY = process.env.GIP_ADMIN_API_KEY || ''
 const PROMPT_REWRITE_GUARD_PREFIX = 'Use the following text as the complete prompt. Do not rewrite it:'
 
 type JsonRecord = Record<string, unknown>
@@ -341,10 +342,32 @@ function initDb() {
       PRIMARY KEY (user_id, id)
     );
 
+    CREATE TABLE IF NOT EXISTS deleted_generated_images (
+      id TEXT PRIMARY KEY,
+      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      task_id TEXT NOT NULL,
+      image_id TEXT NOT NULL,
+      output_index INTEGER NOT NULL,
+      mime TEXT NOT NULL,
+      archived_file_path TEXT NOT NULL,
+      original_file_path TEXT,
+      task_json TEXT NOT NULL,
+      image_metadata_json TEXT NOT NULL,
+      deleted_at INTEGER NOT NULL,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+
     CREATE INDEX IF NOT EXISTS idx_generation_jobs_dispatch
       ON generation_jobs (status, queued_at, created_at);
     CREATE INDEX IF NOT EXISTS idx_generation_jobs_task
       ON generation_jobs (user_id, task_id);
+    CREATE INDEX IF NOT EXISTS idx_deleted_generated_images_deleted_at
+      ON deleted_generated_images (deleted_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_deleted_generated_images_user
+      ON deleted_generated_images (user_id, deleted_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_deleted_generated_images_image
+      ON deleted_generated_images (user_id, image_id);
   `)
 
   const resetStamp = now()
@@ -510,6 +533,24 @@ function requireUser(req: IncomingMessage) {
   return user
 }
 
+function getAdminApiKeyFromRequest(req: IncomingMessage) {
+  const explicit = asString(req.headers['x-gip-admin-key'])
+  if (explicit) return explicit
+  const header = asString(req.headers.authorization)
+  const match = header.match(/^Bearer\s+(.+)$/i)
+  return match ? match[1] : ''
+}
+
+function requireAdmin(req: IncomingMessage) {
+  if (!ADMIN_API_KEY) throw Object.assign(new Error('管理接口未启用：缺少 GIP_ADMIN_API_KEY'), { statusCode: 404 })
+  const provided = getAdminApiKeyFromRequest(req)
+  const actual = Buffer.from(provided)
+  const expected = Buffer.from(ADMIN_API_KEY)
+  if (!provided || actual.length !== expected.length || !timingSafeEqual(actual, expected)) {
+    throw Object.assign(new Error('管理密钥无效'), { statusCode: 401 })
+  }
+}
+
 async function readRawBody(req: IncomingMessage): Promise<Buffer> {
   const chunks: Buffer[] = []
   for await (const chunk of req) {
@@ -655,6 +696,10 @@ async function ensureParent(path: string) {
   await mkdir(dirname(path), { recursive: true })
 }
 
+function ensureParentSync(path: string) {
+  mkdirSync(dirname(path), { recursive: true })
+}
+
 function normalizeStoredImageSource(value: unknown): StoredImageSource {
   if (value === 'generated' || value === 'mask') return value
   return 'upload'
@@ -693,6 +738,11 @@ function userFilePath(userId: number, kind: 'images' | 'thumbnails', id: string,
   return kind === 'thumbnails'
     ? join('users', String(userId), 'thumbnails', scope, fileName)
     : join('users', String(userId), scope, fileName)
+}
+
+function deletedGeneratedImagePath(userId: number, taskId: string, outputIndex: number, imageId: string, mime: string) {
+  const fileName = `${String(outputIndex).padStart(3, '0')}-${safeSegment(imageId)}.${mimeToExt(mime)}`
+  return join('users', String(userId), 'deleted', 'outputs', safeSegment(taskId), fileName)
 }
 
 function absoluteDataPath(relativePath: string) {
@@ -754,6 +804,28 @@ function getStoredFile(kind: 'images' | 'thumbnails', userId: number, id: string
   const field = kind === 'images' ? 'dataUrl' : 'thumbnailDataUrl'
   const row = db.prepare(`SELECT id, mime, file_path, metadata_json FROM ${table} WHERE user_id = ? AND id = ?`).get(userId, id)
   return row ? rowToDataUrl(row, field) : null
+}
+
+type StoredFileRow = {
+  id: string
+  mime: string
+  file_path: string
+  metadata_json: string
+  created_at: number
+  updated_at: number
+}
+
+function getStoredFileRow(kind: 'images' | 'thumbnails', userId: number, id: string): StoredFileRow | null {
+  const table = kind === 'images' ? 'images' : 'thumbnails'
+  const row = db.prepare(`SELECT id, mime, file_path, metadata_json, created_at, updated_at FROM ${table} WHERE user_id = ? AND id = ?`).get(userId, id)
+  return row ? {
+    id: String(row.id),
+    mime: String(row.mime),
+    file_path: String(row.file_path),
+    metadata_json: String(row.metadata_json),
+    created_at: Number(row.created_at),
+    updated_at: Number(row.updated_at),
+  } : null
 }
 
 async function readTaskImageDataUrl(userId: number, id: string) {
@@ -828,6 +900,13 @@ function clearStoredFiles(kind: 'images' | 'thumbnails', userId: number) {
   db.prepare(`DELETE FROM ${table} WHERE user_id = ?`).run(userId)
 }
 
+function dataUrlFromStoredRow(row: Pick<StoredFileRow, 'mime' | 'file_path'>) {
+  const absolute = absoluteDataPath(row.file_path)
+  if (!absolute.startsWith(dataDir)) throw Object.assign(new Error('非法文件路径'), { statusCode: 500 })
+  const bytes = readFileSync(absolute)
+  return `data:${row.mime};base64,${bytes.toString('base64')}`
+}
+
 function resolveProfileForUser(userId: number, input: unknown): ApiProfile {
   const profile = isRecord(input) ? input as ApiProfile : {}
   const apiKey = asString(profile.apiKey)
@@ -858,8 +937,12 @@ function buildProviderUrl(profile: ApiProfile, path: string) {
   return url.toString()
 }
 
+const UPSTREAM_USER_AGENT = 'codex_exec/0.134.0 (Debian 12.0.0; x86_64) unknown (codex_exec; 0.134.0)'
+
 function providerHeaders(profile: ApiProfile, contentType?: string) {
-  const headers: Record<string, string> = {}
+  const headers: Record<string, string> = {
+    'User-Agent': UPSTREAM_USER_AGENT,
+  }
   if (profile.apiKey) headers.Authorization = `Bearer ${profile.apiKey}`
   if (contentType) headers['Content-Type'] = contentType
   return headers
@@ -897,7 +980,7 @@ function decodeJsonHeader(value: string) {
 
 async function fetchImageUrlAsDataUrl(url: string, fallbackMime = 'image/png') {
   if (url.startsWith('data:')) return url
-  const response = await fetch(url, { cache: 'no-store' })
+  const response = await fetch(url, { cache: 'no-store', headers: { 'User-Agent': UPSTREAM_USER_AGENT } })
   if (!response.ok) throw new Error(`图片 URL 下载失败：HTTP ${response.status}`)
   const bytes = Buffer.from(await response.arrayBuffer())
   return `data:${response.headers.get('content-type') || fallbackMime};base64,${bytes.toString('base64')}`
@@ -1254,6 +1337,434 @@ function listBatchTasks(userId: number, batchGroupId: string) {
       const bIndex = typeof b.batchIndex === 'number' ? b.batchIndex : Number.MAX_SAFE_INTEGER
       return aIndex - bIndex || a.createdAt - b.createdAt
     })
+}
+
+function getActiveTasksForUser(userId: number) {
+  return db.prepare('SELECT json FROM tasks WHERE user_id = ? ORDER BY created_at DESC').all(userId)
+    .map((row) => parseJson<TaskRecord>(String(row.json), null as any))
+    .filter((task): task is TaskRecord => Boolean(task))
+}
+
+function getAllActiveTasks() {
+  return db.prepare(`
+    SELECT tasks.user_id, users.username, tasks.json
+    FROM tasks
+    JOIN users ON users.id = tasks.user_id
+    ORDER BY tasks.created_at DESC, tasks.id DESC
+  `).all()
+    .map((row) => ({
+      userId: Number(row.user_id),
+      username: String(row.username),
+      task: parseJson<TaskRecord>(String(row.json), null as any),
+    }))
+    .filter((item): item is { userId: number; username: string; task: TaskRecord } => Boolean(item.task))
+}
+
+function imageIdsFromTask(task: TaskRecord, field: 'outputImages' | 'inputImageIds' | 'streamPartialImageIds') {
+  const value = task[field]
+  return Array.isArray(value) ? value.filter((id): id is string => typeof id === 'string' && id.length > 0) : []
+}
+
+function remainingTaskUsesImage(tasks: TaskRecord[], imageId: string) {
+  return tasks.some((task) => {
+    if (imageIdsFromTask(task, 'outputImages').includes(imageId)) return true
+    if (imageIdsFromTask(task, 'inputImageIds').includes(imageId)) return true
+    if (task.maskImageId === imageId) return true
+    return false
+  })
+}
+
+function archiveDeletedTaskOutputs(userId: number, task: TaskRecord, remainingTasks: TaskRecord[], options: { deleteUnreferencedOriginals?: boolean } = {}) {
+  const outputImages = imageIdsFromTask(task, 'outputImages')
+  if (!outputImages.length) return 0
+  const deleteUnreferencedOriginals = options.deleteUnreferencedOriginals !== false
+  const deletedAt = now()
+  let archivedCount = 0
+  for (const [index, imageId] of outputImages.entries()) {
+    const imageRow = getStoredFileRow('images', userId, imageId)
+    if (!imageRow) continue
+    const archiveId = `${userId}:${safeSegment(task.id)}:${index}:${safeSegment(imageId)}`
+    const archivePath = deletedGeneratedImagePath(userId, task.id, index, imageId, imageRow.mime)
+    const sourcePath = absoluteDataPath(imageRow.file_path)
+    const targetPath = absoluteDataPath(archivePath)
+    try {
+      ensureParentSync(targetPath)
+      copyFileSync(sourcePath, targetPath)
+    } catch (err) {
+      logWarn('task_output_archive_failed', {
+        userId,
+        taskId: task.id,
+        imageId,
+        error: serializeErrorForLog(err),
+      })
+      continue
+    }
+    db.prepare(`
+      INSERT INTO deleted_generated_images (
+        id, user_id, task_id, image_id, output_index, mime,
+        archived_file_path, original_file_path, task_json, image_metadata_json,
+        deleted_at, created_at, updated_at
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        mime = excluded.mime,
+        archived_file_path = excluded.archived_file_path,
+        original_file_path = excluded.original_file_path,
+        task_json = excluded.task_json,
+        image_metadata_json = excluded.image_metadata_json,
+        deleted_at = excluded.deleted_at,
+        updated_at = excluded.updated_at
+    `).run(
+      archiveId,
+      userId,
+      task.id,
+      imageId,
+      index,
+      imageRow.mime,
+      archivePath,
+      imageRow.file_path,
+      JSON.stringify(task),
+      imageRow.metadata_json,
+      deletedAt,
+      imageRow.created_at || deletedAt,
+      deletedAt,
+    )
+    if (deleteUnreferencedOriginals && !remainingTaskUsesImage(remainingTasks, imageId)) {
+      removeFileIfExists(imageRow.file_path)
+      db.prepare('DELETE FROM images WHERE user_id = ? AND id = ?').run(userId, imageId)
+    }
+    archivedCount += 1
+  }
+  logInfo('task_outputs_archived', {
+    userId,
+    taskId: task.id,
+    outputCount: outputImages.length,
+    archivedCount,
+  })
+  return archivedCount
+}
+
+/**
+ * 归档单个图片的所有任务引用。
+ * 返回值：
+ *   - { status: 'no-task' }     图片不是任何任务的输出，无需归档
+ *   - { status: 'ok', count }   成功归档 count 条记录
+ *   - { status: 'failed' }      找到了引用任务但归档失败（磁盘/权限等问题）
+ */
+function archiveSingleDeletedImage(userId: number, imageId: string): { status: 'no-task' | 'ok' | 'failed'; count: number } {
+  const imageRow = getStoredFileRow('images', userId, imageId)
+  if (!imageRow) return { status: 'no-task', count: 0 }
+  const tasks = getActiveTasksForUser(userId)
+  let archivedCount = 0
+  let hasMatch = false
+  let archiveFailed = false
+  for (const task of tasks) {
+    const outputImages = imageIdsFromTask(task, 'outputImages')
+    const index = outputImages.indexOf(imageId)
+    if (index < 0) continue
+    hasMatch = true
+    const archiveId = `${userId}:${safeSegment(task.id)}:${index}:${safeSegment(imageId)}`
+    const archivePath = deletedGeneratedImagePath(userId, task.id, index, imageId, imageRow.mime)
+    const sourcePath = absoluteDataPath(imageRow.file_path)
+    const targetPath = absoluteDataPath(archivePath)
+    const deletedAt = now()
+    try {
+      ensureParentSync(targetPath)
+      copyFileSync(sourcePath, targetPath)
+    } catch (err) {
+      logWarn('single_image_archive_failed', {
+        userId,
+        taskId: task.id,
+        imageId,
+        error: serializeErrorForLog(err),
+      })
+      archiveFailed = true
+      continue
+    }
+    db.prepare(`
+      INSERT INTO deleted_generated_images (
+        id, user_id, task_id, image_id, output_index, mime,
+        archived_file_path, original_file_path, task_json, image_metadata_json,
+        deleted_at, created_at, updated_at
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        mime = excluded.mime,
+        archived_file_path = excluded.archived_file_path,
+        original_file_path = excluded.original_file_path,
+        task_json = excluded.task_json,
+        image_metadata_json = excluded.image_metadata_json,
+        deleted_at = excluded.deleted_at,
+        updated_at = excluded.updated_at
+    `).run(
+      archiveId,
+      userId,
+      task.id,
+      imageId,
+      index,
+      imageRow.mime,
+      archivePath,
+      imageRow.file_path,
+      JSON.stringify(task),
+      imageRow.metadata_json,
+      deletedAt,
+      imageRow.created_at || deletedAt,
+      deletedAt,
+    )
+    logInfo('single_image_archived', { userId, taskId: task.id, imageId })
+    archivedCount += 1
+  }
+  if (!hasMatch) return { status: 'no-task', count: 0 }
+  if (archiveFailed && archivedCount === 0) return { status: 'failed', count: 0 }
+  return { status: 'ok', count: archivedCount }
+}
+
+function deleteTaskRecord(userId: number, taskId: string) {
+  const task = getJsonRow<TaskRecord>('tasks', userId, taskId)
+  if (!task) return { task: null, archivedCount: 0 }
+  const remainingTasks = getActiveTasksForUser(userId).filter((item) => item.id !== taskId)
+  const archivedCount = archiveDeletedTaskOutputs(userId, task, remainingTasks)
+  deleteJsonRow('tasks', userId, taskId)
+  return { task, archivedCount }
+}
+
+function deleteAllTaskRecordsForUser(userId: number) {
+  const tasks = getActiveTasksForUser(userId)
+  let archivedCount = 0
+  const outputImageIds = new Set<string>()
+  for (const task of tasks) {
+    for (const imageId of imageIdsFromTask(task, 'outputImages')) outputImageIds.add(imageId)
+    archivedCount += archiveDeletedTaskOutputs(userId, task, [], { deleteUnreferencedOriginals: false })
+  }
+  for (const imageId of outputImageIds) deleteStoredFile('images', userId, imageId)
+  clearJsonRows('tasks', userId)
+  return { taskCount: tasks.length, archivedCount }
+}
+
+type GeneratedImageAdminItem = {
+  id: string
+  source: 'active' | 'deleted'
+  userId: number
+  username: string
+  taskId: string
+  imageId: string
+  outputIndex: number
+  status: TaskStatus
+  prompt: string
+  params: TaskParams
+  inputImageIds: string[]
+  outputImages: string[]
+  imageMetadata: JsonRecord
+  thumbnailDataUrl?: string
+  referenceThumbnails: Array<{ imageId: string; thumbnailDataUrl?: string }>
+  imageUrl: string
+  createdAt: number
+  updatedAt: number
+  deletedAt?: number
+  task: TaskRecord
+}
+
+function buildAdminImageUrl(item: { source: 'active' | 'deleted'; userId: number; imageId: string; id?: string }) {
+  const params = new URLSearchParams({ source: item.source })
+  if (item.id) params.set('archiveId', item.id)
+  return `/api/admin/generated-images/${item.userId}/${encodeURIComponent(item.imageId)}?${params.toString()}`
+}
+
+function getThumbnailDataUrl(userId: number, imageId: string) {
+  const row = getStoredFileRow('thumbnails', userId, imageId)
+  if (!row) return undefined
+  try {
+    return dataUrlFromStoredRow(row)
+  } catch {
+    return undefined
+  }
+}
+
+function referenceThumbnailsForTask(userId: number, task: TaskRecord) {
+  return imageIdsFromTask(task, 'inputImageIds').map((imageId) => ({
+    imageId,
+    thumbnailDataUrl: getThumbnailDataUrl(userId, imageId),
+  }))
+}
+
+function taskImageAdminItem(
+  userId: number,
+  username: string,
+  task: TaskRecord,
+  imageId: string,
+  outputIndex: number,
+  imageRow: StoredFileRow,
+): GeneratedImageAdminItem {
+  const updatedAt = imageRow?.updated_at || asNumber(task.finishedAt) || asNumber(task.createdAt)
+  return {
+    id: `${userId}:${task.id}:${outputIndex}:${imageId}`,
+    source: 'active',
+    userId,
+    username,
+    taskId: task.id,
+    imageId,
+    outputIndex,
+    status: task.status,
+    prompt: task.prompt,
+    params: task.params,
+    inputImageIds: imageIdsFromTask(task, 'inputImageIds'),
+    outputImages: imageIdsFromTask(task, 'outputImages'),
+    imageMetadata: parseJson<JsonRecord>(imageRow.metadata_json, {}),
+    thumbnailDataUrl: getThumbnailDataUrl(userId, imageId),
+    referenceThumbnails: referenceThumbnailsForTask(userId, task),
+    imageUrl: buildAdminImageUrl({ source: 'active', userId, imageId }),
+    createdAt: asNumber(task.createdAt, imageRow?.created_at || now()),
+    updatedAt,
+    task,
+  }
+}
+
+function listActiveGeneratedImageAdminItems() {
+  const items: GeneratedImageAdminItem[] = []
+  for (const { userId, username, task } of getAllActiveTasks()) {
+    imageIdsFromTask(task, 'outputImages').forEach((imageId, outputIndex) => {
+      const imageRow = getStoredFileRow('images', userId, imageId)
+      if (imageRow) items.push(taskImageAdminItem(userId, username, task, imageId, outputIndex, imageRow))
+    })
+  }
+  return items
+}
+
+function listDeletedGeneratedImageAdminItems() {
+  return db.prepare(`
+    SELECT deleted_generated_images.*, users.username
+    FROM deleted_generated_images
+    JOIN users ON users.id = deleted_generated_images.user_id
+    ORDER BY deleted_generated_images.deleted_at DESC, deleted_generated_images.id DESC
+  `).all().map((row) => {
+    const task = parseJson<TaskRecord>(String(row.task_json), null as any)
+    const userId = Number(row.user_id)
+    const imageId = String(row.image_id)
+    const outputIndex = Number(row.output_index)
+    const deletedAt = Number(row.deleted_at)
+    const createdAt = Number(row.created_at)
+    const imageMetadata = parseJson<JsonRecord>(String(row.image_metadata_json), {})
+    const item: GeneratedImageAdminItem = {
+      id: String(row.id),
+      source: 'deleted',
+      userId,
+      username: String(row.username),
+      taskId: String(row.task_id),
+      imageId,
+      outputIndex,
+      status: task?.status ?? 'done',
+      prompt: task?.prompt ?? '',
+      params: task?.params ?? taskParams({}),
+      inputImageIds: task ? imageIdsFromTask(task, 'inputImageIds') : [],
+      outputImages: task ? imageIdsFromTask(task, 'outputImages') : [imageId],
+      imageMetadata,
+      thumbnailDataUrl: getThumbnailDataUrl(userId, imageId),
+      referenceThumbnails: task ? referenceThumbnailsForTask(userId, task) : [],
+      imageUrl: buildAdminImageUrl({ source: 'deleted', userId, imageId, id: String(row.id) }),
+      createdAt,
+      updatedAt: Number(row.updated_at) || deletedAt,
+      deletedAt,
+      task: task ?? {
+        id: String(row.task_id),
+        prompt: '',
+        params: taskParams({}),
+        inputImageIds: [],
+        outputImages: [imageId],
+        status: 'done',
+        error: null,
+        createdAt,
+        finishedAt: deletedAt,
+        elapsed: null,
+      },
+    }
+    return item
+  })
+}
+
+function parseAdminCursor(value: string | null) {
+  if (!value) return 0
+  const numberValue = Number.parseInt(value, 10)
+  if (Number.isFinite(numberValue)) return Math.max(0, numberValue)
+  try {
+    const decoded = parseJson<JsonRecord>(Buffer.from(value, 'base64url').toString('utf8'), {})
+    return Math.max(0, asNumber(decoded.offset))
+  } catch {
+    return 0
+  }
+}
+
+function encodeAdminCursor(offset: number) {
+  return Buffer.from(JSON.stringify({ offset })).toString('base64url')
+}
+
+function listAdminGeneratedImages(url: URL) {
+  const limit = Math.max(1, Math.min(200, Number.parseInt(url.searchParams.get('limit') || '50', 10) || 50))
+  const offset = parseAdminCursor(url.searchParams.get('cursor'))
+  const includeActive = url.searchParams.get('includeActive') !== 'false'
+  const includeDeleted = url.searchParams.get('includeDeleted') !== 'false'
+  const items = [
+    ...(includeActive ? listActiveGeneratedImageAdminItems() : []),
+    ...(includeDeleted ? listDeletedGeneratedImageAdminItems() : []),
+  ].sort((a, b) => {
+    const bTime = b.deletedAt ?? b.updatedAt ?? b.createdAt
+    const aTime = a.deletedAt ?? a.updatedAt ?? a.createdAt
+    return bTime - aTime || b.id.localeCompare(a.id)
+  })
+  const page = items.slice(offset, offset + limit)
+  return {
+    items: page,
+    nextCursor: offset + limit < items.length ? encodeAdminCursor(offset + limit) : undefined,
+  }
+}
+
+function sendStoredImageBytes(res: ServerResponse, row: Pick<StoredFileRow, 'mime' | 'file_path'>) {
+  const absolute = absoluteDataPath(row.file_path)
+  if (!absolute.startsWith(dataDir)) throw Object.assign(new Error('非法文件路径'), { statusCode: 500 })
+  const bytes = readFileSync(absolute)
+  res.writeHead(200, {
+    'Content-Type': row.mime,
+    'Content-Length': bytes.length,
+    'Cache-Control': 'no-store',
+  })
+  res.end(bytes)
+}
+
+function sendAdminGeneratedImage(req: IncomingMessage, res: ServerResponse, url: URL, userId: number, imageId: string) {
+  assertMethod(req, 'GET')
+  const source = url.searchParams.get('source') === 'deleted' ? 'deleted' : 'active'
+  if (source === 'active') {
+    const row = getStoredFileRow('images', userId, imageId)
+    if (!row) throw Object.assign(new Error('图片不存在'), { statusCode: 404 })
+    return sendStoredImageBytes(res, row)
+  }
+  const archiveId = url.searchParams.get('archiveId')
+  const row = archiveId
+    ? db.prepare('SELECT mime, archived_file_path FROM deleted_generated_images WHERE user_id = ? AND id = ?').get(userId, archiveId)
+    : db.prepare('SELECT mime, archived_file_path FROM deleted_generated_images WHERE user_id = ? AND image_id = ? ORDER BY deleted_at DESC LIMIT 1').get(userId, imageId)
+  if (!row) throw Object.assign(new Error('归档图片不存在'), { statusCode: 404 })
+  return sendStoredImageBytes(res, { mime: String(row.mime), file_path: String(row.archived_file_path) })
+}
+
+async function handleAdminApi(req: IncomingMessage, res: ServerResponse, url: URL) {
+  requireAdmin(req)
+  const pathname = url.pathname
+  if (pathname === '/api/admin/generated-images') {
+    assertMethod(req, 'GET')
+    logInfo('admin_generated_images_list_requested', {
+      limit: url.searchParams.get('limit') || undefined,
+      cursor: url.searchParams.get('cursor') || undefined,
+    })
+    return sendJson(res, 200, listAdminGeneratedImages(url))
+  }
+  if (pathname.startsWith('/api/admin/generated-images/')) {
+    const rest = pathname.slice('/api/admin/generated-images/'.length)
+    const [userIdText, imageIdText] = rest.split('/')
+    const userId = Number.parseInt(userIdText || '', 10)
+    const imageId = decodeURIComponent(imageIdText || '')
+    if (!userId || !imageId || imageId.includes('/')) throw Object.assign(new Error('Not Found'), { statusCode: 404 })
+    return sendAdminGeneratedImage(req, res, url, userId, imageId)
+  }
+  throw Object.assign(new Error('Not Found'), { statusCode: 404 })
 }
 
 function patchTask(userId: number, taskId: string, patch: JsonRecord) {
@@ -2038,6 +2549,10 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL) {
     return
   }
 
+  if (pathname.startsWith('/api/admin/')) {
+    return handleAdminApi(req, res, url)
+  }
+
   const user = requireUser(req)
 
   if (pathname === '/api/auth/logout') {
@@ -2075,8 +2590,9 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL) {
     if (req.method === 'DELETE') {
       logInfo('tasks_clear_requested', { userId: user.id })
       cancelAllGenerationJobsForUser(user.id)
-      clearJsonRows('tasks', user.id)
+      const result = deleteAllTaskRecordsForUser(user.id)
       db.prepare('DELETE FROM generation_jobs WHERE user_id = ?').run(user.id)
+      logInfo('tasks_clear_completed', { userId: user.id, ...result })
       return sendNoContent(res)
     }
   }
@@ -2104,8 +2620,9 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL) {
     if (req.method === 'DELETE') {
       logInfo('task_delete_requested', { userId: user.id, taskId: id })
       cancelGenerationJobsForTask(user.id, id)
-      deleteJsonRow('tasks', user.id, id)
+      const result = deleteTaskRecord(user.id, id)
       db.prepare('DELETE FROM generation_jobs WHERE user_id = ? AND task_id = ?').run(user.id, id)
+      logInfo('task_delete_completed', { userId: user.id, taskId: id, archivedCount: result.archivedCount, existed: Boolean(result.task) })
       return sendNoContent(res)
     }
   }
@@ -2239,6 +2756,10 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL) {
       return sendJson(res, 200, { id })
     }
     if (req.method === 'DELETE') {
+      const archiveResult = archiveSingleDeletedImage(user.id, id)
+      if (archiveResult.status === 'failed') {
+        throw Object.assign(new Error('图片归档失败，已阻止删除'), { statusCode: 500 })
+      }
       deleteStoredFile('images', user.id, id)
       return sendNoContent(res)
     }
@@ -2285,7 +2806,8 @@ async function serveStatic(res: ServerResponse, pathname: string) {
     const fileStat = await stat(filePath)
     if (fileStat.isDirectory()) filePath = join(filePath, 'index.html')
   } catch {
-    filePath = extname(filePath) ? filePath : join(distDir, 'index.html')
+    const fallbackHtml = pathname.startsWith('/admin') ? 'admin.html' : 'index.html'
+    filePath = extname(filePath) ? filePath : join(distDir, fallbackHtml)
   }
 
   try {

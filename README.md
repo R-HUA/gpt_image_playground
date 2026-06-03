@@ -114,96 +114,141 @@
 
 ## 🚀 部署与使用
 
-支持多种部署与开发方式。无论使用哪种方式，你都可以预设默认的 API 节点。
+项目提供两种部署模式：**纯前端静态部署**（无后端，API 请求直连上游）和 **全栈 Server 部署**（含 Node.js 后端，支持用户认证、图片存储与管理后台）。
 
-<details>
-<summary><strong>▲ 方式一：Vercel 一键部署 (推荐)</strong></summary>
+---
 
-[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2FCookSleep%2Fgpt_image_playground&project-name=gpt-image-playground&repository-name=gpt-image-playground)
+### 🐳 Docker 全栈 Server 部署（推荐）
 
-点击上方按钮导入仓库即可，Vercel 会自动执行构建并部署静态文件。
+全栈模式包含 Node.js 后端，支持**用户登录认证**、**服务端图片存储与归档**、**Admin 管理后台**等完整功能。
 
-**配置默认 API URL**：在 Vercel 项目的 **Settings → Environment Variables** 中添加 `VITE_DEFAULT_API_URL`（如 `https://api.openai.com/v1`），然后重新部署即可生效。
+#### 前置准备
 
-**导入自定义服务商配置**：`VITE_DEFAULT_API_URL` 除了填写普通 API 地址外，也支持直接填写 `.json` 配置 URL 或带 `settings` 参数的分享 URL。设为配置 URL 时，页面启动后会自动导入其中的自定义服务商和 API 配置，设置页显示的是配置 JSON 中 profile 定义的 `baseUrl`（而非配置 URL 本身）。
+**1. 创建用户配置文件**
 
-**绑定自定义域名 (国内直连)**：Vercel 默认分配的 `.vercel.app` 域名在国内通常无法直接访问。如果你希望在国内直连访问，请在 Vercel 项目的 **Settings → Domains** 中绑定你自己的域名。
-
-**配置自动更新**：
-
-本项目已在 `vercel.json` 中关闭了默认的自动部署。若需在同步 GitHub 上游代码后自动更新 Vercel 部署：
-
-1. 在 Vercel 项目设置 **Settings -> Git** 的 **Deploy Hooks** 中创建一个名为 `Release` 的 Hook（Branch 填 `main`）并复制生成的 URL。
-2. 在你 Fork 的 GitHub 仓库设置 **Settings -> Secrets and variables -> Actions** 中，新建 Secret `VERCEL_DEPLOY_HOOK`，填入刚才的 URL。
-
-此后，每次在 GitHub 点击 **Sync fork** 同步上游，都会自动触发 Vercel 构建部署最新版。
-
-</details>
-
-<details>
-<summary><strong>☁️ 方式二：Cloudflare Workers 部署</strong></summary>
-
-项目已内置 Wrangler 配置，可将 Vite 构建产物作为 Cloudflare Workers 静态资源部署。
-
-**1. 登录 Cloudflare**
+复制示例文件并修改为你的用户名和密码：
 
 ```bash
-npx wrangler login
+cp config/users.example.json config/users.json
 ```
 
-**2. 部署到 Workers**
+编辑 `config/users.json`：
+
+```json
+{
+  "users": [
+    {
+      "username": "your-username",
+      "password": "your-strong-password"
+    }
+  ]
+}
+```
+
+> ⚠️ **务必修改默认的 `change-me` 密码**，否则任何看到默认配置的人都能登录。
+
+**2. 创建环境变量文件（可选）**
+
+复制环境变量示例并按需修改：
 
 ```bash
-npm run deploy:cf
+cp .env.docker.example .env
 ```
 
-部署脚本会先执行 `npm run build`，再通过 `wrangler deploy` 上传 `dist/` 目录。
+`.env` 文件完整变量说明：
 
-**配置默认 API URL**：Cloudflare Workers 的环境变量不会自动改写已经构建好的静态文件。若需预设默认 API 地址，请在构建前设置 `VITE_DEFAULT_API_URL` 后再部署。
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `GIP_HTTP_PORT` | `8080` | 宿主机暴露的端口 |
+| `GIP_GENERATION_CONCURRENCY` | `1` | 后端同时执行的图片生成任务数 |
+| `GIP_CUSTOM_POLL_TIMEOUT_SECONDS` | `900` | 自定义异步服务商轮询超时（秒） |
+| `GIP_ADMIN_API_KEY` | *(空)* | Admin 管理后台 API 密钥。为空时管理接口不可访问 |
+
+#### 启动服务
 
 ```bash
-VITE_DEFAULT_API_URL=https://api.openai.com/v1 npm run deploy:cf
+docker compose up -d
 ```
 
-PowerShell 示例：
+`docker-compose.yml` 关键配置：
 
-```powershell
-$env:VITE_DEFAULT_API_URL="https://api.openai.com/v1"; npm run deploy:cf
+```yaml
+services:
+  gpt-image-playground:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile.server
+    image: gpt-image-playground:local
+    container_name: gpt-image-playground
+    restart: unless-stopped
+    environment:
+      PORT: "3000"
+      GIP_DATA_DIR: /app/data
+      GIP_USERS_CONFIG: /app/config/users.json
+      GIP_GENERATION_CONCURRENCY: "${GIP_GENERATION_CONCURRENCY:-1}"
+      GIP_CUSTOM_POLL_TIMEOUT_SECONDS: "${GIP_CUSTOM_POLL_TIMEOUT_SECONDS:-900}"
+      GIP_ADMIN_API_KEY: "${GIP_ADMIN_API_KEY:-}"
+    ports:
+      - "${GIP_HTTP_PORT:-8080}:3000"
+    volumes:
+      - gip-data:/app/data          # 持久化数据库与图片
+      - ./config:/app/config:ro      # 挂载用户配置（只读）
 ```
 
-**导入自定义服务商配置**：`VITE_DEFAULT_API_URL` 除了填写普通 API 地址外，也支持直接填写 `.json` 配置 URL 或带 `settings` 参数的分享 URL。设为配置 URL 时，页面启动后会自动导入其中的自定义服务商和 API 配置，设置页显示的是配置 JSON 中 profile 定义的 `baseUrl`（而非配置 URL 本身）。
+#### 环境变量详解（Server 模式）
 
-</details>
+| 环境变量 | 默认值 | 说明 |
+|---|---|---|
+| `PORT` | `3000` | 容器内 Node.js 监听端口 |
+| `GIP_DATA_DIR` | `/app/data` | 数据存储目录（SQLite 数据库 + 图片文件） |
+| `GIP_USERS_CONFIG` | `/app/config/users.json` | 用户认证配置文件路径 |
+| `GIP_GENERATION_CONCURRENCY` | `1` | 并发图片生成任务上限 |
+| `GIP_CUSTOM_POLL_TIMEOUT_SECONDS` | `900` | 自定义异步服务商轮询超时 |
+| `GIP_ADMIN_API_KEY` | *(空)* | Admin 管理后台密钥。设置后可通过 `/admin` 页面访问管理功能 |
 
-<details>
-<summary><strong>🐳 方式三：Docker 部署</strong></summary>
+#### Admin 管理后台
 
-官方镜像已发布至 GitHub Container Registry。Docker 部署支持在运行时注入默认配置。
+设置 `GIP_ADMIN_API_KEY` 后，访问 `http://<your-host>:<port>/admin` 即可进入管理后台。管理后台支持：
 
-**环境变量说明：**
+- 查看所有用户的生成图片（活跃与已删除）
+- 按状态过滤、分页浏览
+- 查看任务详情与实际 API 参数
 
-- `DEFAULT_API_URL`：设置页面上默认显示的 API 地址（如 `https://api.openai.com/v1`）。也支持填写 `.json` 配置 URL 或带 `settings` 参数的分享 URL 来导入自定义服务商配置（详见下方说明）。
-- `API_PROXY_URL`：配置内置代理实际转发到的完整 API 基础地址（仅开启代理时有效）。代理不会自动补 `/v1`，OpenAI 兼容接口通常必须填写到版本前缀，如 `https://api.openai.com/v1`。
-- `ENABLE_API_PROXY`：设为 `true` 开启容器内置 Nginx 同源代理，用于解决浏览器跨域（CORS）限制。开启后，前端 **API 代理** 开关默认开启，浏览器会请求同源的 `/api-proxy/{接口相对路径}`，再由 Nginx 拼接到 `API_PROXY_URL` 后转发；用户仍可在设置中手动关闭。
-- `LOCK_API_PROXY`：设为 `true` 时，在 `ENABLE_API_PROXY=true` 的前提下将前端 **API 代理** 开关强制锁定为开启，用户无法关闭。
-- `HOST` / `PORT`：指定容器内 Nginx 监听的地址和端口（默认 `0.0.0.0:80`）。
+#### 数据持久化
 
-> ⚠️ **安全警告**：开启 API 代理后，任何人都能将你的服务器作为代理来请求目标 API。建议仅在有访问控制（如 IP 白名单）或本地网络中开启。
+- **`gip-data` 卷**：存储 SQLite 数据库（用户数据、任务记录、图片元数据）和所有上传/生成的图片文件。删除此卷将丢失所有数据。
+- **`config` 目录**：以只读方式挂载 `./config`，包含 `users.json` 用户认证文件。修改后重启容器生效。
 
-> 💡 **导入自定义服务商配置**：`DEFAULT_API_URL` 除了填写普通 API 地址外，也支持直接填写 `.json` 配置 URL 或带 `settings` 参数的分享 URL。设为配置 URL 时，页面启动后会自动导入其中的自定义服务商和 API 配置，设置页显示的是配置 JSON 中 profile 定义的 `baseUrl`（而非配置 URL 本身）。
+#### 更新与升级
 
-> 💡 **隐藏真实 API 地址**：如果不希望用户在前端看到真实的 API 上游地址，可以配合 `ENABLE_API_PROXY=true` 和 `LOCK_API_PROXY=true` 强制所有请求走服务器代理，再将 `API_PROXY_URL` 设为真实的 API 上游地址。根据使用的服务商类型，`DEFAULT_API_URL` 的填法不同：
->
-> - **OpenAI 兼容接口**：将 `DEFAULT_API_URL` 留空或填写一个占位地址（如 `https://proxy`）。
-> - **自定义服务商配置**：将 `DEFAULT_API_URL` 设为配置 URL（`.json` 或带 `settings` 参数的分享 URL），配置 JSON 中 profile 的 `baseUrl` 留空或填占位地址，并设置 `apiProxy:true`。
->
-> 这样前端设置页只会显示空值或占位地址，真实 API 地址仅存在于服务器侧的 `API_PROXY_URL`，不会暴露给用户。
->
-> 自定义服务商开启代理仅支持同步返回图片的配置；包含 `taskIdPath` 或 `poll` 的异步任务自定义服务商暂不支持 API 代理。
+```bash
+# 重新构建镜像并更新
+docker compose build --no-cache
+docker compose up -d
 
-> 💡 **兼容迁移**：旧版本中的 `API_URL` 已拆分为 `DEFAULT_API_URL` 和 `API_PROXY_URL`。容器启动时会自动将遗留的 `API_URL` 作为两个新变量的兜底值，实现无缝兼容。建议更新配置文件，逐步迁移至新变量。
+# 或拉取新镜像后更新（若使用预构建镜像）
+docker compose pull && docker compose up -d
+```
 
-**1. Docker CLI 示例**
+---
+
+### 🐳 Docker 纯前端静态部署
+
+仅部署前端静态文件（Nginx），无后端服务。所有 API 请求从浏览器直连上游，数据存储在用户浏览器 IndexedDB 中。
+
+#### 环境变量说明
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `DEFAULT_API_URL` | *(空)* | 设置页面默认显示的 API 地址。也支持 `.json` 配置 URL 或带 `settings` 参数的分享 URL |
+| `API_PROXY_URL` | *(空)* | API 代理实际转发的完整 API 基础地址。代理不会自动补 `/v1`，OpenAI 兼容接口需填至版本前缀 |
+| `ENABLE_API_PROXY` | `false` | 设为 `true` 开启 Nginx 同源代理，解决浏览器 CORS 限制 |
+| `LOCK_API_PROXY` | `false` | 设为 `true` 锁定前端 API 代理开关为开启状态，用户无法关闭 |
+| `HOST` / `PORT` | `0.0.0.0:80` | 容器内 Nginx 监听的地址和端口 |
+
+> ⚠️ **安全警告**：开启 API 代理后，任何人都能将你的服务器作为代理请求目标 API。建议仅在有访问控制或本地网络中开启。
+
+#### CLI 启动示例
 
 ```bash
 docker run -d -p 8080:80 \
@@ -214,35 +259,7 @@ docker run -d -p 8080:80 \
   ghcr.io/cooksleep/gpt_image_playground:latest
 ```
 
-**隐藏真实 API 地址示例（OpenAI 兼容接口）：**
-
-```bash
-docker run -d -p 8080:80 \
-  -e DEFAULT_API_URL= \
-  -e API_PROXY_URL=https://real-api.example.com/v1 \
-  -e ENABLE_API_PROXY=true \
-  -e LOCK_API_PROXY=true \
-  ghcr.io/cooksleep/gpt_image_playground:latest
-```
-
-> 上例中设置页的 API URL 为空，实际请求通过代理转发到 `API_PROXY_URL`。
-
-**隐藏真实 API 地址示例（同步自定义服务商配置）：**
-
-```bash
-docker run -d -p 8080:80 \
-  -e DEFAULT_API_URL='https://example.com/?settings={"customProviders":[...],"profiles":[{"baseUrl":"","apiProxy":true,...}]}' \
-  -e API_PROXY_URL=https://real-api.example.com/v1 \
-  -e ENABLE_API_PROXY=true \
-  -e LOCK_API_PROXY=true \
-  ghcr.io/cooksleep/gpt_image_playground:latest
-```
-
-> 上例中 `DEFAULT_API_URL` 为同步自定义服务商配置分享 URL，profile 的 `baseUrl` 留空且 `apiProxy:true`；真实 API 地址仅在 `API_PROXY_URL` 中配置，前端不可见。异步任务自定义服务商暂不支持开启代理。
-
-*(注：使用 host 网络时加 `--network host`，修改容器监听端口使用 `-e PORT=28080`)*
-
-**2. Docker Compose 示例**
+#### Docker Compose 示例
 
 ```yaml
 services:
@@ -255,45 +272,93 @@ services:
     restart: unless-stopped
 ```
 
-**更新说明：**
+#### 隐藏真实 API 地址
 
-使用 `latest` 标签时，重新拉取镜像并重启即可更新（如 `docker compose pull && docker compose up -d`）。若需固定版本可使用官方提供的版本号标签（如 `0.2.x`）。
+配合 `ENABLE_API_PROXY=true` 和 `LOCK_API_PROXY=true` 可将真实 API 地址保留在服务器侧：
 
-</details>
+```bash
+docker run -d -p 8080:80 \
+  -e DEFAULT_API_URL= \
+  -e API_PROXY_URL=https://real-api.example.com/v1 \
+  -e ENABLE_API_PROXY=true \
+  -e LOCK_API_PROXY=true \
+  ghcr.io/cooksleep/gpt_image_playground:latest
+```
 
-<details>
-<summary><strong>💻 方式四：本地开发与静态构建</strong></summary>
+> 前端设置页只会显示空值或占位地址，真实 API 地址仅存在于服务器侧的 `API_PROXY_URL`。
+
+#### 导入自定义服务商配置
+
+`DEFAULT_API_URL` 除了填写普通 API 地址，也支持填写 `.json` 配置 URL 或带 `settings` 参数的分享 URL，页面启动后会自动导入自定义服务商和 API 配置。
+
+#### 旧版兼容
+
+旧版本的 `API_URL` 已拆分为 `DEFAULT_API_URL` + `API_PROXY_URL`。容器启动时会自动将遗留的 `API_URL` 作为两个新变量的兜底值。
+
+---
+
+### ▲ Vercel 一键部署
+
+[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2FCookSleep%2Fgpt_image_playground&project-name=gpt-image-playground&repository-name=gpt-image-playground)
+
+点击上方按钮导入仓库即可。在 Vercel 项目的 **Settings → Environment Variables** 中添加 `VITE_DEFAULT_API_URL`（如 `https://api.openai.com/v1`），然后重新部署即可生效。
+
+> 💡 Vercel 仅支持前端静态部署，无后端服务。如需用户认证和数据持久化，请使用 Docker 全栈 Server 部署。
+
+> 💡 **绑定自定义域名（国内直连）**：Vercel 默认分配的 `.vercel.app` 域名在国内通常无法直接访问，可在 **Settings → Domains** 中绑定自己的域名。
+
+> 💡 **自动更新**：在 Vercel **Settings → Git → Deploy Hooks** 创建 Hook（Branch 填 `main`），将生成的 URL 存入 Fork 仓库的 GitHub Secret `VERCEL_DEPLOY_HOOK`，每次 Sync fork 后自动触发部署。
+
+---
+
+### ☁️ Cloudflare Workers 部署
+
+项目已内置 Wrangler 配置，可将 Vite 构建产物作为 Cloudflare Workers 静态资源部署。
+
+```bash
+npx wrangler login
+VITE_DEFAULT_API_URL=https://api.openai.com/v1 npm run deploy:cf
+```
+
+PowerShell 示例：
+
+```powershell
+npx wrangler login
+$env:VITE_DEFAULT_API_URL="https://api.openai.com/v1"; npm run deploy:cf
+```
+
+> 💡 Workers 仅支持前端静态部署，无后端服务。
+
+---
+
+### 💻 本地开发与静态构建
 
 **1. 环境准备与启动**
 
-你可以在项目根目录新建 `.env.local` 文件配置默认 API URL（如 `VITE_DEFAULT_API_URL=https://api.openai.com/v1`）。然后安装依赖并启动：
-
-**导入自定义服务商配置**：`VITE_DEFAULT_API_URL` 除了填写普通 API 地址外，也支持直接填写 `.json` 配置 URL 或带 `settings` 参数的分享 URL。设为配置 URL 时，页面启动后会自动导入其中的自定义服务商和 API 配置，设置页显示的是配置 JSON 中 profile 定义的 `baseUrl`（而非配置 URL 本身）。
+在项目根目录新建 `.env.local` 配置默认 API URL（如 `VITE_DEFAULT_API_URL=https://api.openai.com/v1`），然后：
 
 ```bash
 npm install
 npm run dev
 ```
 
-**2. 本地开发跨域代理 (可选)**
+**2. 本地开发跨域代理（可选）**
 
-如果在本地开发时遇到浏览器的 CORS 限制，可开启本地代理转发：
+遇到浏览器 CORS 限制时，可开启本地代理转发：
 
 ```bash
 cp dev-proxy.config.example.json dev-proxy.config.json
 ```
 
-修改 `dev-proxy.config.json`，将 `target` 设置为真实的完整 API 基础地址。代理不会自动补 `/v1`，OpenAI 兼容接口通常必须填写到版本前缀，如 `https://api.example.com/v1`。重启开发服务器后，在页面设置中开启 **API 代理** 即可（请求将被转发如 `http://localhost:5173/api-proxy/... -> target/...`）。此功能仅在 `npm run dev` 阶段生效，不会影响打包产物。
+修改 `dev-proxy.config.json` 中的 `target` 为完整 API 地址（含 `/v1`），重启开发服务器后在页面设置中开启 **API 代理**。
 
-**3. 本地故障模拟 API (可选)**
-
-如果需要复现图片 URL 跨域、接口返回结构异常、原始响应查看等问题，可启动内置模拟服务：
+**3. 本地故障模拟 API（可选）**
 
 ```powershell
 npm run mock:api
 ```
 
-使用方式见 [本地故障模拟 API](docs/mock-image-api.md)。
+详见 [本地故障模拟 API](docs/mock-image-api.md)。
 
 **4. 构建静态产物**
 
@@ -301,9 +366,7 @@ npm run mock:api
 npm run build
 ```
 
-构建输出的文件位于 `dist/` 目录下，可将其部署至任何静态文件服务器（如普通 Nginx、GitHub Pages、Netlify 等）。
-
-</details>
+输出位于 `dist/` 目录，可部署至任意静态文件服务器。
 
 ---
 

@@ -52,22 +52,6 @@ export default function BatchTaskCard({ tasks, onClick, onDelete, isSelected }: 
       }`}
       onClick={onClick}
     >
-      {onDelete && (
-        <button
-          type="button"
-          onClick={(e) => {
-            e.stopPropagation()
-            onDelete()
-          }}
-          onTouchStart={(e) => e.stopPropagation()}
-          onTouchEnd={(e) => e.stopPropagation()}
-          className="absolute right-2 top-2 z-10 rounded-md bg-white/90 p-1.5 text-gray-400 shadow-sm ring-1 ring-black/5 transition hover:bg-red-50 hover:text-red-500 dark:bg-gray-950/90 dark:ring-white/10 dark:hover:bg-red-500/10"
-          title="删除批量任务"
-          aria-label="删除批量任务"
-        >
-          <TrashIcon className="h-4 w-4" />
-        </button>
-      )}
       <div className="flex h-40 cursor-pointer">
         <div className="relative flex h-full w-40 min-w-[10rem] flex-shrink-0 items-center justify-center overflow-hidden bg-gray-100 dark:bg-black/20">
           {thumbSrc ? (
@@ -80,9 +64,6 @@ export default function BatchTaskCard({ tasks, onClick, onDelete, isSelected }: 
               <span className="text-xs">批量任务</span>
             </div>
           )}
-          <span className="absolute bottom-1 right-1 rounded bg-black/60 px-1.5 py-0.5 text-xs text-white">
-            {done}/{total}
-          </span>
         </div>
         <div className="flex min-w-0 flex-1 flex-col p-3">
           <div className="mb-2 min-h-0 flex-1 overflow-hidden">
@@ -90,12 +71,28 @@ export default function BatchTaskCard({ tasks, onClick, onDelete, isSelected }: 
               {first?.prompt || '(无提示词)'}
             </p>
           </div>
-          <div className="mt-auto flex flex-wrap gap-1.5 text-xs">
-            <span className="rounded bg-gray-100 px-1.5 py-0.5 text-gray-600 dark:bg-white/[0.04] dark:text-gray-300">总数 {total}</span>
-            <span className="rounded bg-green-50 px-1.5 py-0.5 text-green-600 dark:bg-green-500/10 dark:text-green-300">完成 {done}</span>
-            <span className="rounded bg-blue-50 px-1.5 py-0.5 text-blue-600 dark:bg-blue-500/10 dark:text-blue-300">运行 {running}</span>
-            <span className="rounded bg-gray-100 px-1.5 py-0.5 text-gray-500 dark:bg-white/[0.04]">排队 {queued}</span>
-            {error > 0 && <span className="rounded bg-red-50 px-1.5 py-0.5 text-red-500 dark:bg-red-500/10">失败 {error}</span>}
+          <div className="mt-auto flex h-8 items-center justify-between gap-2 border-t border-gray-100 pt-2 text-xs text-gray-500 dark:border-white/[0.08] dark:text-gray-400">
+            <div className="min-w-0 truncate">
+              <span className="font-medium text-gray-700 dark:text-gray-200">完成 {done}/{total}</span>
+              {running + queued > 0 && <span className="ml-2">进行中 {running + queued}</span>}
+              {error > 0 && <span className="ml-2 text-red-500">失败 {error}</span>}
+            </div>
+            {onDelete && (
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation()
+                  onDelete()
+                }}
+                onTouchStart={(e) => e.stopPropagation()}
+                onTouchEnd={(e) => e.stopPropagation()}
+                className="flex h-7 w-7 flex-shrink-0 items-center justify-center rounded-md text-gray-400 transition hover:bg-red-50 hover:text-red-500 dark:hover:bg-red-500/10"
+                title="删除批量任务"
+                aria-label="删除批量任务"
+              >
+                <TrashIcon className="h-4 w-4" />
+              </button>
+            )}
           </div>
         </div>
       </div>

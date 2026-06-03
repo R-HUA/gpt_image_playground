@@ -92,6 +92,7 @@ export interface AppSettings {
   persistInputOnRestart: boolean
   reuseTaskApiProfileTemporarily: boolean
   alwaysShowRetryButton: boolean
+  taskCompletionNotification: boolean
   enterSubmit: boolean
   referenceImageEditAction: ReferenceImageEditAction
   agentScrollToBottomAfterSubmit: boolean
@@ -193,6 +194,8 @@ export interface TaskRecord {
   elapsed: number | null
   /** 是否收藏 */
   isFavorite?: boolean
+  /** 所属收藏夹 ID 列表 */
+  favoriteCollectionIds?: string[]
   /** 来源模式：画廊 / Agent */
   sourceMode?: AppMode
   /** Agent 对话 ID */
@@ -215,6 +218,13 @@ export interface TaskRecord {
   batchSize?: number
   /** Agent 图像工具实际动作 */
   agentToolAction?: 'generate' | 'edit' | 'auto' | string
+}
+
+export interface FavoriteCollection {
+  id: string
+  name: string
+  createdAt: number
+  updatedAt: number
 }
 
 // ===== Agent 模式 =====
@@ -411,6 +421,8 @@ export interface ExportData {
   exportedAt: string
   settings?: AppSettings
   tasks?: TaskRecord[]
+  favoriteCollections?: FavoriteCollection[]
+  defaultFavoriteCollectionId?: string | null
   agentConversations?: AgentConversation[]
   /** imageId → 图片信息 */
   imageFiles?: Record<string, {
