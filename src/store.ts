@@ -67,6 +67,7 @@ export const DEFAULT_FAVORITE_COLLECTION_NAME = '默认'
 
 const imageCache = new Map<string, string>()
 const thumbnailCache = new Map<string, { dataUrl: string; width?: number; height?: number; thumbnailVersion?: number }>()
+const pendingInputImageStores = new Map<string, Promise<InputImage>>()
 const thumbnailBackfillIds = new Map<string, 'visible' | 'background'>()
 const thumbnailBackfillRunningIds = new Set<string>()
 const thumbnailSubscribers = new Map<string, Set<(thumbnail: { dataUrl: string; width?: number; height?: number }) => void>>()
@@ -177,6 +178,10 @@ function cacheImage(id: string, dataUrl: string) {
     if (oldestKey == null) break
     imageCache.delete(oldestKey)
   }
+}
+
+function forgetPendingInputStore(id: string) {
+  pendingInputImageStores.delete(id)
 }
 
 function getCachedThumbnail(id: string) {
@@ -420,13 +425,41 @@ function normalizeStringArray(value: unknown): string[] {
 async function materializeInputImages(images: InputImage[]) {
   const materialized: InputImage[] = []
   const equivalentImageIds: Record<string, string> = {}
+  const seenImageIds = new Set<string>()
+  const pendingStores = new Map<string, Promise<InputImage>>()
 
   for (const image of images) {
-    const id = await storeImage(image.dataUrl, 'upload')
-    cacheImage(id, image.dataUrl)
-    const nextImage = id === image.id ? image : { ...image, id }
+    const pendingStore = pendingInputImageStores.get(image.id)
+    if (pendingStore) pendingStores.set(image.id, pendingStore)
+  }
+
+  for (const image of images) {
+    let nextImage = image
+    const pendingStore = pendingStores.get(image.id)
+
+    if (pendingStore) {
+      try {
+        nextImage = await pendingStore
+      } finally {
+        if (pendingInputImageStores.get(image.id) === pendingStore) forgetPendingInputStore(image.id)
+      }
+      if (nextImage.id !== image.id) equivalentImageIds[image.id] = nextImage.id
+    } else if (image.id.startsWith('in_')) {
+      // 已有正式 upload ID 的图片已持久化；是否仍在内存缓存中不应决定是否重存。
+      nextImage = image
+    } else {
+      const id = await storeImage(image.dataUrl, 'upload')
+      cacheImage(id, image.dataUrl)
+      nextImage = id === image.id ? image : { ...image, id }
+      if (id !== image.id) equivalentImageIds[image.id] = id
+    }
+
+    if (seenImageIds.has(nextImage.id)) {
+      equivalentImageIds[image.id] = nextImage.id
+      continue
+    }
+    seenImageIds.add(nextImage.id)
     materialized.push(nextImage)
-    if (id !== image.id) equivalentImageIds[image.id] = id
   }
 
   return {
@@ -439,18 +472,32 @@ async function materializeInputImageIds(imageIds: string[]) {
   const inputImageIds: string[] = []
   const inputImages: InputImage[] = []
   const equivalentImageIds: Record<string, string> = {}
+  const seenImageIds = new Set<string>()
 
   for (const imageId of imageIds) {
     const dataUrl = await ensureImageCached(imageId)
     if (!dataUrl) {
-      inputImageIds.push(imageId)
+      if (!seenImageIds.has(imageId)) {
+        seenImageIds.add(imageId)
+        inputImageIds.push(imageId)
+      }
+      continue
+    }
+    if (imageId.startsWith('in_')) {
+      if (!seenImageIds.has(imageId)) {
+        seenImageIds.add(imageId)
+        inputImageIds.push(imageId)
+        inputImages.push({ id: imageId, dataUrl })
+      }
       continue
     }
     const inputId = await storeImage(dataUrl, 'upload')
     cacheImage(inputId, dataUrl)
+    if (inputId !== imageId) equivalentImageIds[imageId] = inputId
+    if (seenImageIds.has(inputId)) continue
+    seenImageIds.add(inputId)
     inputImageIds.push(inputId)
     inputImages.push({ id: inputId, dataUrl })
-    if (inputId !== imageId) equivalentImageIds[imageId] = inputId
   }
 
   return {
@@ -1053,6 +1100,8 @@ export async function deleteImageIfUnreferenced(imageId: string) {
   thumbnailBackfillIds.delete(imageId)
   thumbnailBackfillRunningIds.delete(imageId)
   thumbnailSubscribers.delete(imageId)
+  forgetPendingInputStore(imageId)
+  if (imageId.startsWith('pending_')) return
   if (isImageReferencedByState(useStore.getState(), imageId)) return
   try {
     await deleteImage(imageId)
@@ -1376,7 +1425,16 @@ export const useStore = create<AppState>()(
           if (idx < 0 || idx >= s.inputImages.length) return s
           const previous = s.inputImages[idx]
           if (!previous || previous.id === img.id) return s
-          if (s.inputImages.some((item, itemIdx) => itemIdx !== idx && item.id === img.id)) return s
+          if (s.inputImages.some((item, itemIdx) => itemIdx !== idx && item.id === img.id)) {
+            removedImageId = previous.id
+            const inputImages = s.inputImages.filter((_, itemIdx) => itemIdx !== idx)
+            const shouldClearMask = previous.id === s.maskDraft?.targetImageId
+            return syncActiveInputDraft(s, {
+              inputImages,
+              prompt: remapImageMentionsForOrder(s.prompt, s.inputImages, inputImages, { [previous.id]: img.id }),
+              ...(shouldClearMask ? { maskDraft: null, maskEditorImageId: null } : {}),
+            })
+          }
           removedImageId = previous.id
           const inputImages = s.inputImages.map((item, itemIdx) => itemIdx === idx ? img : item)
           const shouldClearMask = previous.id === s.maskDraft?.targetImageId
@@ -1386,11 +1444,15 @@ export const useStore = create<AppState>()(
             ...(shouldClearMask ? { maskDraft: null, maskEditorImageId: null } : {}),
           })
         })
-        if (removedImageId) void deleteImageIfUnreferenced(removedImageId)
+        if (removedImageId) {
+          forgetPendingInputStore(removedImageId)
+          void deleteImageIfUnreferenced(removedImageId)
+        }
       },
       removeInputImage: (idx) =>
         set((s) => {
           const removed = s.inputImages[idx]
+          if (removed) forgetPendingInputStore(removed.id)
           const inputImages = s.inputImages.filter((_, i) => i !== idx)
           const shouldClearMask = removed?.id === s.maskDraft?.targetImageId
           return syncActiveInputDraft(s, {
@@ -1401,7 +1463,10 @@ export const useStore = create<AppState>()(
         }),
       clearInputImages: () =>
         set((s) => {
-          for (const img of s.inputImages) imageCache.delete(img.id)
+          for (const img of s.inputImages) {
+            imageCache.delete(img.id)
+            forgetPendingInputStore(img.id)
+          }
           return syncActiveInputDraft(s, {
             inputImages: [],
             prompt: remapImageMentionsForOrder(s.prompt, s.inputImages, []),
@@ -4820,7 +4885,7 @@ export async function reuseConfig(task: TaskRecord) {
   for (const imgId of task.inputImageIds) {
     const dataUrl = await ensureImageCached(imgId)
     if (dataUrl) {
-      const inputId = await storeImage(dataUrl, 'upload')
+      const inputId = imgId.startsWith('in_') ? imgId : await storeImage(dataUrl, 'upload')
       cacheImage(inputId, dataUrl)
       imgs.push({ id: inputId, dataUrl })
       if (inputId !== imgId) equivalentImageIds[imgId] = inputId
@@ -5312,11 +5377,36 @@ export async function importData(file: File, options: ImportOptions = { importCo
   }
 }
 
-/** 添加图片到输入（文件上传） */
+/** 添加图片到输入（文件上传）—— 立即显示，后台存储 */
 export async function addImageFromFile(file: File): Promise<void> {
-  const image = await createInputImageFromFile(file)
-  if (!image) return
-  useStore.getState().addInputImage(image)
+  if (!file.type.startsWith('image/')) return
+  const dataUrl = await fileToDataUrl(file)
+  // 用临时 ID 立即显示
+  const tempId = `pending_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
+  const storeRequest = storeImage(dataUrl, 'upload').then((id) => {
+    cacheImage(id, dataUrl)
+    return { id, dataUrl }
+  })
+  pendingInputImageStores.set(tempId, storeRequest)
+  useStore.getState().addInputImage({ id: tempId, dataUrl })
+  // 后台存储，完成后替换 ID
+  void storeRequest
+    .then((image) => {
+      const currentIdx = useStore.getState().inputImages.findIndex((img) => img.id === tempId)
+      if (currentIdx >= 0 && useStore.getState().inputImages[currentIdx]?.id === tempId) {
+        useStore.getState().replaceInputImage(currentIdx, image)
+      }
+    })
+    .catch((err) => {
+      const currentIdx = useStore.getState().inputImages.findIndex((img) => img.id === tempId)
+      if (currentIdx >= 0 && useStore.getState().inputImages[currentIdx]?.id === tempId) {
+        useStore.getState().removeInputImage(currentIdx)
+      }
+      useStore.getState().showToast(`图片存储失败：${err instanceof Error ? err.message : String(err)}`, 'error')
+    })
+    .finally(() => {
+      if (pendingInputImageStores.get(tempId) === storeRequest) pendingInputImageStores.delete(tempId)
+    })
 }
 
 export async function createInputImageFromFile(file: File): Promise<InputImage | null> {
