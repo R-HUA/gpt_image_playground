@@ -1144,9 +1144,7 @@ export default function InputBar() {
       const toAdd = accepted.slice(0, remaining)
       const discarded = accepted.length - toAdd.length
 
-      for (const file of toAdd) {
-        await addImageFromFile(file)
-      }
+      await Promise.all(toAdd.map((file) => addImageFromFile(file)))
 
       if (discarded > 0) {
         useStore.getState().showToast(

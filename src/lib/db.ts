@@ -1,11 +1,15 @@
 import type { AgentConversation, StoredImage, StoredImageThumbnail, TaskRecord } from '../types'
 import { backendAgentConversations, backendImages, backendTasks, backendThumbnails, type TaskListQuery, type TaskPage } from './backendApi'
 
-const THUMBNAIL_MAX_SIZE = 720
-const THUMBNAIL_QUALITY = 0.9
-const THUMBNAIL_VERSION = 2
+const THUMBNAIL_MAX_SIZE = 360
+const THUMBNAIL_QUALITY = 0.7
+const THUMBNAIL_VERSION = 3
 
 export const CURRENT_THUMBNAIL_VERSION = THUMBNAIL_VERSION
+
+type StoredImageSource = NonNullable<StoredImage['source']>
+
+const storeImageInFlight = new Map<StoredImageSource, Map<string, Promise<string>>>()
 
 // ===== Tasks =====
 
@@ -143,7 +147,28 @@ export function clearImages(): Promise<void> {
  * via POST /api/images/store. The client only provides thumbnail data generated
  * with Canvas; the backend performs all writes in a single endpoint.
  */
-export async function storeImage(dataUrl: string, source: NonNullable<StoredImage['source']> = 'upload'): Promise<string> {
+export async function storeImage(dataUrl: string, source: StoredImageSource = 'upload'): Promise<string> {
+  let sourceInFlight = storeImageInFlight.get(source)
+  if (!sourceInFlight) {
+    sourceInFlight = new Map()
+    storeImageInFlight.set(source, sourceInFlight)
+  }
+  const existing = sourceInFlight.get(dataUrl)
+  if (existing) return existing
+
+  const request = persistImage(dataUrl, source)
+  sourceInFlight.set(dataUrl, request)
+  try {
+    return await request
+  } finally {
+    if (sourceInFlight.get(dataUrl) === request) {
+      sourceInFlight.delete(dataUrl)
+      if (sourceInFlight.size === 0) storeImageInFlight.delete(source)
+    }
+  }
+}
+
+async function persistImage(dataUrl: string, source: StoredImageSource): Promise<string> {
   const thumbnail = await safeCreateImageThumbnail(dataUrl)
   const { id } = await backendImages.store({
     dataUrl,

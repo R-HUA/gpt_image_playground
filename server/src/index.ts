@@ -1,7 +1,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 import { createHmac, randomBytes, scryptSync, timingSafeEqual, createHash } from 'node:crypto'
 import { copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'node:fs'
-import { mkdir, readFile, stat } from 'node:fs/promises'
+import { mkdir, readFile, stat, writeFile } from 'node:fs/promises'
 import { dirname, extname, join, normalize, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { Readable } from 'node:stream'
@@ -692,6 +692,12 @@ function dataUrlToBuffer(dataUrl: string) {
   return { mime, bytes }
 }
 
+function dataUrlMime(dataUrl: string) {
+  const match = dataUrl.match(/^data:([^;,]+)?(?:;base64)?,/)
+  if (!match) throw Object.assign(new Error('无效的 data URL'), { statusCode: 400 })
+  return match[1] || 'application/octet-stream'
+}
+
 async function ensureParent(path: string) {
   await mkdir(dirname(path), { recursive: true })
 }
@@ -768,7 +774,7 @@ async function putStoredFile(kind: 'images' | 'thumbnails', userId: number, id: 
   const relativePath = userFilePath(userId, kind, id, mime, source)
   const absolute = absoluteDataPath(relativePath)
   await ensureParent(absolute)
-  writeFileSync(absolute, bytes)
+  await writeFile(absolute, bytes)
 
   const table = kind === 'images' ? 'images' : 'thumbnails'
   const previous = db.prepare(`SELECT file_path FROM ${table} WHERE user_id = ? AND id = ?`).get(userId, id)
@@ -788,10 +794,10 @@ async function putStoredFile(kind: 'images' | 'thumbnails', userId: number, id: 
   `).run(userId, id, mime, relativePath, JSON.stringify(metadata), asNumber(record.createdAt, stamp), stamp)
 }
 
-function rowToDataUrl(row: DbRow, dataUrlField: string) {
+async function rowToDataUrl(row: DbRow, dataUrlField: string) {
   const metadata = parseJson<JsonRecord>(String(row.metadata_json), {})
   const absolute = absoluteDataPath(String(row.file_path))
-  const bytes = readFileSync(absolute)
+  const bytes = await readFile(absolute)
   return {
     ...metadata,
     id: String(row.id),
@@ -799,11 +805,11 @@ function rowToDataUrl(row: DbRow, dataUrlField: string) {
   }
 }
 
-function getStoredFile(kind: 'images' | 'thumbnails', userId: number, id: string) {
+async function getStoredFile(kind: 'images' | 'thumbnails', userId: number, id: string) {
   const table = kind === 'images' ? 'images' : 'thumbnails'
   const field = kind === 'images' ? 'dataUrl' : 'thumbnailDataUrl'
   const row = db.prepare(`SELECT id, mime, file_path, metadata_json FROM ${table} WHERE user_id = ? AND id = ?`).get(userId, id)
-  return row ? rowToDataUrl(row, field) : null
+  return row ? await rowToDataUrl(row, field) : null
 }
 
 type StoredFileRow = {
@@ -828,8 +834,21 @@ function getStoredFileRow(kind: 'images' | 'thumbnails', userId: number, id: str
   } : null
 }
 
+function getStoredFileMetadataRecord(kind: 'images' | 'thumbnails', userId: number, id: string): JsonRecord | null {
+  const row = getStoredFileRow(kind, userId, id)
+  if (!row) return null
+  return {
+    ...parseJson<JsonRecord>(row.metadata_json, {}),
+    id: row.id,
+    mime: row.mime,
+    filePath: row.file_path,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  }
+}
+
 async function readTaskImageDataUrl(userId: number, id: string) {
-  const image = getStoredFile('images', userId, id)
+  const image = await getStoredFile('images', userId, id)
   const dataUrl = isRecord(image) ? asString(image.dataUrl) : ''
   if (!dataUrl) throw Object.assign(new Error('输入图片已不存在'), { statusCode: 400 })
   return dataUrl
@@ -844,9 +863,8 @@ async function readTaskImageDataUrls(userId: number, ids: string[]) {
 async function storeGeneratedImage(userId: number, dataUrl: string) {
   const source: StoredImageSource = 'generated'
   const id = createStoredImageId(dataUrl, source)
-  const existing = getStoredFile('images', userId, id)
-  const { mime } = dataUrlToBuffer(dataUrl)
-  const filePath = userFilePath(userId, 'images', id, mime, source)
+  const existing = getStoredFileMetadataRecord('images', userId, id)
+  const filePath = asString(existing?.filePath) || userFilePath(userId, 'images', id, asString(existing?.mime) || dataUrlMime(dataUrl), source)
   if (!existing) {
     await putStoredFile('images', userId, id, {
       id,
@@ -879,11 +897,11 @@ function updateStoredFileMetadata(kind: 'images' | 'thumbnails', userId: number,
   return true
 }
 
-function listStoredFiles(kind: 'images' | 'thumbnails', userId: number) {
+async function listStoredFiles(kind: 'images' | 'thumbnails', userId: number) {
   const table = kind === 'images' ? 'images' : 'thumbnails'
   const field = kind === 'images' ? 'dataUrl' : 'thumbnailDataUrl'
-  return db.prepare(`SELECT id, mime, file_path, metadata_json FROM ${table} WHERE user_id = ? ORDER BY created_at DESC`).all(userId)
-    .map((row) => rowToDataUrl(row, field))
+  const rows = db.prepare(`SELECT id, mime, file_path, metadata_json FROM ${table} WHERE user_id = ? ORDER BY created_at DESC`).all(userId)
+  return Promise.all(rows.map((row) => rowToDataUrl(row, field)))
 }
 
 function deleteStoredFile(kind: 'images' | 'thumbnails', userId: number, id: string) {
@@ -900,10 +918,10 @@ function clearStoredFiles(kind: 'images' | 'thumbnails', userId: number) {
   db.prepare(`DELETE FROM ${table} WHERE user_id = ?`).run(userId)
 }
 
-function dataUrlFromStoredRow(row: Pick<StoredFileRow, 'mime' | 'file_path'>) {
+async function dataUrlFromStoredRow(row: Pick<StoredFileRow, 'mime' | 'file_path'>) {
   const absolute = absoluteDataPath(row.file_path)
   if (!absolute.startsWith(dataDir)) throw Object.assign(new Error('非法文件路径'), { statusCode: 500 })
-  const bytes = readFileSync(absolute)
+  const bytes = await readFile(absolute)
   return `data:${row.mime};base64,${bytes.toString('base64')}`
 }
 
@@ -1379,7 +1397,15 @@ function archiveDeletedTaskOutputs(userId: number, task: TaskRecord, remainingTa
   if (!outputImages.length) return 0
   const deleteUnreferencedOriginals = options.deleteUnreferencedOriginals !== false
   const deletedAt = now()
-  let archivedCount = 0
+  const failedImageIds: string[] = []
+  const archiveRecords: Array<{
+    imageId: string
+    imageRow: StoredFileRow
+    archiveId: string
+    archivePath: string
+    outputIndex: number
+  }> = []
+
   for (const [index, imageId] of outputImages.entries()) {
     const imageRow = getStoredFileRow('images', userId, imageId)
     if (!imageRow) continue
@@ -1397,8 +1423,30 @@ function archiveDeletedTaskOutputs(userId: number, task: TaskRecord, remainingTa
         imageId,
         error: serializeErrorForLog(err),
       })
+      failedImageIds.push(imageId)
       continue
     }
+    archiveRecords.push({
+      imageId,
+      imageRow,
+      archiveId,
+      archivePath,
+      outputIndex: index,
+    })
+  }
+  if (failedImageIds.length > 0) {
+    logWarn('task_outputs_archive_incomplete', {
+      userId,
+      taskId: task.id,
+      outputCount: outputImages.length,
+      archivedCount: archiveRecords.length,
+      failedCount: failedImageIds.length,
+    })
+    throw Object.assign(new Error('任务输出图片归档失败，已阻止删除'), { statusCode: 500, failedImageIds })
+  }
+
+  let archivedCount = 0
+  for (const record of archiveRecords) {
     db.prepare(`
       INSERT INTO deleted_generated_images (
         id, user_id, task_id, image_id, output_index, mime,
@@ -1415,32 +1463,51 @@ function archiveDeletedTaskOutputs(userId: number, task: TaskRecord, remainingTa
         deleted_at = excluded.deleted_at,
         updated_at = excluded.updated_at
     `).run(
-      archiveId,
+      record.archiveId,
       userId,
       task.id,
-      imageId,
-      index,
-      imageRow.mime,
-      archivePath,
-      imageRow.file_path,
+      record.imageId,
+      record.outputIndex,
+      record.imageRow.mime,
+      record.archivePath,
+      record.imageRow.file_path,
       JSON.stringify(task),
-      imageRow.metadata_json,
+      record.imageRow.metadata_json,
       deletedAt,
-      imageRow.created_at || deletedAt,
+      record.imageRow.created_at || deletedAt,
       deletedAt,
     )
-    if (deleteUnreferencedOriginals && !remainingTaskUsesImage(remainingTasks, imageId)) {
-      removeFileIfExists(imageRow.file_path)
-      db.prepare('DELETE FROM images WHERE user_id = ? AND id = ?').run(userId, imageId)
-    }
     archivedCount += 1
   }
+
+  if (deleteUnreferencedOriginals) {
+    for (const record of archiveRecords) {
+      if (!remainingTaskUsesImage(remainingTasks, record.imageId)) {
+        removeFileIfExists(record.imageRow.file_path)
+        db.prepare('DELETE FROM images WHERE user_id = ? AND id = ?').run(userId, record.imageId)
+      }
+    }
+  }
+
   logInfo('task_outputs_archived', {
     userId,
     taskId: task.id,
     outputCount: outputImages.length,
     archivedCount,
   })
+  return archivedCount
+}
+
+/**
+ * 归档用户所有尚未归档的任务输出图片（供批量清空前调用）。
+ * 幂等：已有归档记录的图片会通过 ON CONFLICT DO UPDATE 安全跳过。
+ */
+function archiveAllRemainingTaskOutputs(userId: number): number {
+  const tasks = getActiveTasksForUser(userId)
+  let archivedCount = 0
+  for (const task of tasks) {
+    archivedCount += archiveDeletedTaskOutputs(userId, task, [], { deleteUnreferencedOriginals: false })
+  }
   return archivedCount
 }
 
@@ -1570,31 +1637,31 @@ function buildAdminImageUrl(item: { source: 'active' | 'deleted'; userId: number
   return `/api/admin/generated-images/${item.userId}/${encodeURIComponent(item.imageId)}?${params.toString()}`
 }
 
-function getThumbnailDataUrl(userId: number, imageId: string) {
+async function getThumbnailDataUrl(userId: number, imageId: string) {
   const row = getStoredFileRow('thumbnails', userId, imageId)
   if (!row) return undefined
   try {
-    return dataUrlFromStoredRow(row)
+    return await dataUrlFromStoredRow(row)
   } catch {
     return undefined
   }
 }
 
-function referenceThumbnailsForTask(userId: number, task: TaskRecord) {
-  return imageIdsFromTask(task, 'inputImageIds').map((imageId) => ({
+async function referenceThumbnailsForTask(userId: number, task: TaskRecord) {
+  return Promise.all(imageIdsFromTask(task, 'inputImageIds').map(async (imageId) => ({
     imageId,
-    thumbnailDataUrl: getThumbnailDataUrl(userId, imageId),
-  }))
+    thumbnailDataUrl: await getThumbnailDataUrl(userId, imageId),
+  })))
 }
 
-function taskImageAdminItem(
+async function taskImageAdminItem(
   userId: number,
   username: string,
   task: TaskRecord,
   imageId: string,
   outputIndex: number,
   imageRow: StoredFileRow,
-): GeneratedImageAdminItem {
+): Promise<GeneratedImageAdminItem> {
   const updatedAt = imageRow?.updated_at || asNumber(task.finishedAt) || asNumber(task.createdAt)
   return {
     id: `${userId}:${task.id}:${outputIndex}:${imageId}`,
@@ -1610,8 +1677,8 @@ function taskImageAdminItem(
     inputImageIds: imageIdsFromTask(task, 'inputImageIds'),
     outputImages: imageIdsFromTask(task, 'outputImages'),
     imageMetadata: parseJson<JsonRecord>(imageRow.metadata_json, {}),
-    thumbnailDataUrl: getThumbnailDataUrl(userId, imageId),
-    referenceThumbnails: referenceThumbnailsForTask(userId, task),
+    thumbnailDataUrl: await getThumbnailDataUrl(userId, imageId),
+    referenceThumbnails: await referenceThumbnailsForTask(userId, task),
     imageUrl: buildAdminImageUrl({ source: 'active', userId, imageId }),
     createdAt: asNumber(task.createdAt, imageRow?.created_at || now()),
     updatedAt,
@@ -1619,24 +1686,25 @@ function taskImageAdminItem(
   }
 }
 
-function listActiveGeneratedImageAdminItems() {
-  const items: GeneratedImageAdminItem[] = []
+async function listActiveGeneratedImageAdminItems() {
+  const itemPromises: Array<Promise<GeneratedImageAdminItem>> = []
   for (const { userId, username, task } of getAllActiveTasks()) {
     imageIdsFromTask(task, 'outputImages').forEach((imageId, outputIndex) => {
       const imageRow = getStoredFileRow('images', userId, imageId)
-      if (imageRow) items.push(taskImageAdminItem(userId, username, task, imageId, outputIndex, imageRow))
+      if (imageRow) itemPromises.push(taskImageAdminItem(userId, username, task, imageId, outputIndex, imageRow))
     })
   }
-  return items
+  return Promise.all(itemPromises)
 }
 
-function listDeletedGeneratedImageAdminItems() {
-  return db.prepare(`
+async function listDeletedGeneratedImageAdminItems() {
+  const rows = db.prepare(`
     SELECT deleted_generated_images.*, users.username
     FROM deleted_generated_images
     JOIN users ON users.id = deleted_generated_images.user_id
     ORDER BY deleted_generated_images.deleted_at DESC, deleted_generated_images.id DESC
-  `).all().map((row) => {
+  `).all()
+  return Promise.all(rows.map(async (row) => {
     const task = parseJson<TaskRecord>(String(row.task_json), null as any)
     const userId = Number(row.user_id)
     const imageId = String(row.image_id)
@@ -1658,8 +1726,8 @@ function listDeletedGeneratedImageAdminItems() {
       inputImageIds: task ? imageIdsFromTask(task, 'inputImageIds') : [],
       outputImages: task ? imageIdsFromTask(task, 'outputImages') : [imageId],
       imageMetadata,
-      thumbnailDataUrl: getThumbnailDataUrl(userId, imageId),
-      referenceThumbnails: task ? referenceThumbnailsForTask(userId, task) : [],
+      thumbnailDataUrl: await getThumbnailDataUrl(userId, imageId),
+      referenceThumbnails: task ? await referenceThumbnailsForTask(userId, task) : [],
       imageUrl: buildAdminImageUrl({ source: 'deleted', userId, imageId, id: String(row.id) }),
       createdAt,
       updatedAt: Number(row.updated_at) || deletedAt,
@@ -1678,7 +1746,7 @@ function listDeletedGeneratedImageAdminItems() {
       },
     }
     return item
-  })
+  }))
 }
 
 function parseAdminCursor(value: string | null) {
@@ -1697,14 +1765,14 @@ function encodeAdminCursor(offset: number) {
   return Buffer.from(JSON.stringify({ offset })).toString('base64url')
 }
 
-function listAdminGeneratedImages(url: URL) {
+async function listAdminGeneratedImages(url: URL) {
   const limit = Math.max(1, Math.min(200, Number.parseInt(url.searchParams.get('limit') || '50', 10) || 50))
   const offset = parseAdminCursor(url.searchParams.get('cursor'))
   const includeActive = url.searchParams.get('includeActive') !== 'false'
   const includeDeleted = url.searchParams.get('includeDeleted') !== 'false'
   const items = [
-    ...(includeActive ? listActiveGeneratedImageAdminItems() : []),
-    ...(includeDeleted ? listDeletedGeneratedImageAdminItems() : []),
+    ...(includeActive ? await listActiveGeneratedImageAdminItems() : []),
+    ...(includeDeleted ? await listDeletedGeneratedImageAdminItems() : []),
   ].sort((a, b) => {
     const bTime = b.deletedAt ?? b.updatedAt ?? b.createdAt
     const aTime = a.deletedAt ?? a.updatedAt ?? a.createdAt
@@ -1717,10 +1785,10 @@ function listAdminGeneratedImages(url: URL) {
   }
 }
 
-function sendStoredImageBytes(res: ServerResponse, row: Pick<StoredFileRow, 'mime' | 'file_path'>) {
+async function sendStoredImageBytes(res: ServerResponse, row: Pick<StoredFileRow, 'mime' | 'file_path'>) {
   const absolute = absoluteDataPath(row.file_path)
   if (!absolute.startsWith(dataDir)) throw Object.assign(new Error('非法文件路径'), { statusCode: 500 })
-  const bytes = readFileSync(absolute)
+  const bytes = await readFile(absolute)
   res.writeHead(200, {
     'Content-Type': row.mime,
     'Content-Length': bytes.length,
@@ -1729,7 +1797,7 @@ function sendStoredImageBytes(res: ServerResponse, row: Pick<StoredFileRow, 'mim
   res.end(bytes)
 }
 
-function sendAdminGeneratedImage(req: IncomingMessage, res: ServerResponse, url: URL, userId: number, imageId: string) {
+async function sendAdminGeneratedImage(req: IncomingMessage, res: ServerResponse, url: URL, userId: number, imageId: string) {
   assertMethod(req, 'GET')
   const source = url.searchParams.get('source') === 'deleted' ? 'deleted' : 'active'
   if (source === 'active') {
@@ -1754,7 +1822,7 @@ async function handleAdminApi(req: IncomingMessage, res: ServerResponse, url: UR
       limit: url.searchParams.get('limit') || undefined,
       cursor: url.searchParams.get('cursor') || undefined,
     })
-    return sendJson(res, 200, listAdminGeneratedImages(url))
+    return sendJson(res, 200, await listAdminGeneratedImages(url))
   }
   if (pathname.startsWith('/api/admin/generated-images/')) {
     const rest = pathname.slice('/api/admin/generated-images/'.length)
@@ -2698,7 +2766,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL) {
     if (!dataUrl) throw Object.assign(new Error('缺少图片数据'), { statusCode: 400 })
     const source = normalizeStoredImageSource(body.source)
     const id = createStoredImageId(dataUrl, source)
-    const existing = getStoredFile('images', user.id, id)
+    const existing = getStoredFileMetadataRecord('images', user.id, id)
     const createdAt = asNumber(body.createdAt, now())
     const thumbnail = isRecord(body.thumbnail) ? body.thumbnail : null
     const thumbnailVersion = asNumber(thumbnail?.thumbnailVersion)
@@ -2735,8 +2803,10 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL) {
     return sendJson(res, 200, { id, isNew: !existing })
   }
   if (pathname === '/api/images') {
-    if (req.method === 'GET') return sendJson(res, 200, listStoredFiles('images', user.id))
+    if (req.method === 'GET') return sendJson(res, 200, await listStoredFiles('images', user.id))
     if (req.method === 'DELETE') {
+      const archiveResult = { archivedCount: archiveAllRemainingTaskOutputs(user.id) }
+      logInfo('images_bulk_clear_archived', { userId: user.id, ...archiveResult })
       clearStoredFiles('images', user.id)
       return sendNoContent(res)
     }
@@ -2748,7 +2818,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL) {
   if (pathname.startsWith('/api/images/')) {
     const id = decodeURIComponent(pathname.slice('/api/images/'.length))
     if (!id || id.includes('/')) throw Object.assign(new Error('Not Found'), { statusCode: 404 })
-    if (req.method === 'GET') return sendJson(res, 200, getStoredFile('images', user.id, id))
+    if (req.method === 'GET') return sendJson(res, 200, await getStoredFile('images', user.id, id))
     if (req.method === 'PUT') {
       const body = await readJsonBody<JsonRecord>(req)
       if (!isRecord(body.image)) throw Object.assign(new Error('缺少 image'), { statusCode: 400 })
@@ -2768,7 +2838,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL) {
   if (pathname.startsWith('/api/thumbnails/')) {
     const id = decodeURIComponent(pathname.slice('/api/thumbnails/'.length))
     if (!id || id.includes('/')) throw Object.assign(new Error('Not Found'), { statusCode: 404 })
-    if (req.method === 'GET') return sendJson(res, 200, getStoredFile('thumbnails', user.id, id))
+    if (req.method === 'GET') return sendJson(res, 200, await getStoredFile('thumbnails', user.id, id))
     if (req.method === 'PUT') {
       const body = await readJsonBody<JsonRecord>(req)
       if (!isRecord(body.thumbnail)) throw Object.assign(new Error('缺少 thumbnail'), { statusCode: 400 })
