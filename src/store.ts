@@ -97,6 +97,7 @@ const OPENAI_INTERRUPTED_ERROR = '请求中断'
 const AGENT_STOPPED_MESSAGE = '已停止生成。'
 const AGENT_CONVERSATION_TITLE_MAX_LENGTH = 28
 const ERROR_TOAST_MAX_LENGTH = 80
+const INPUT_IMAGE_STORE_FAILED_PREFIX = '图片存储失败'
 type ToastType = 'info' | 'success' | 'error'
 type AgentInputDraft = {
   prompt: string
@@ -182,6 +183,25 @@ function cacheImage(id: string, dataUrl: string) {
 
 function forgetPendingInputStore(id: string) {
   pendingInputImageStores.delete(id)
+}
+
+function getInputImageStoreErrorMessage(err: unknown) {
+  const message = err instanceof Error ? err.message : String(err)
+  return `${INPUT_IMAGE_STORE_FAILED_PREFIX}：${message}`
+}
+
+function markInputImageStoreFailed(id: string, err: unknown) {
+  const message = getInputImageStoreErrorMessage(err)
+  forgetPendingInputStore(id)
+  const state = useStore.getState()
+  const currentIdx = state.inputImages.findIndex((img) => img.id === id)
+  if (currentIdx >= 0) {
+    state.replaceInputImage(currentIdx, {
+      ...state.inputImages[currentIdx],
+      storageStatus: 'failed',
+    })
+  }
+  useStore.getState().showToast(`${message}。图片已保留，请稍后提交或重新添加。`, 'error')
 }
 
 function getCachedThumbnail(id: string) {
@@ -274,7 +294,7 @@ function scheduleThumbnailBackfillTick() {
     void processNextThumbnailBackfill()
   }
 
-  if ('requestIdleCallback' in window) {
+  if (typeof window !== 'undefined' && 'requestIdleCallback' in window) {
     window.requestIdleCallback(run, { timeout: 2_000 })
   } else {
     globalThis.setTimeout(run, 250)
@@ -446,11 +466,11 @@ async function materializeInputImages(images: InputImage[]) {
       if (nextImage.id !== image.id) equivalentImageIds[image.id] = nextImage.id
     } else if (image.id.startsWith('in_')) {
       // 已有正式 upload ID 的图片已持久化；是否仍在内存缓存中不应决定是否重存。
-      nextImage = image
+      nextImage = image.storageStatus ? { id: image.id, dataUrl: image.dataUrl } : image
     } else {
       const id = await storeImage(image.dataUrl, 'upload')
       cacheImage(id, image.dataUrl)
-      nextImage = id === image.id ? image : { ...image, id }
+      nextImage = id === image.id && !image.storageStatus ? image : { id, dataUrl: image.dataUrl }
       if (id !== image.id) equivalentImageIds[image.id] = id
     }
 
@@ -783,6 +803,30 @@ function getLocalStateStorageName(userId: number) {
   return `${LOCAL_STATE_STORAGE_KEY}:user:${userId}`
 }
 
+function isTransientInputImage(image: InputImage) {
+  return image.id.startsWith('pending_') || image.storageStatus === 'pending' || image.storageStatus === 'failed'
+}
+
+function hasUnmaterializedInputImages(images: InputImage[]) {
+  return images.some((image) => isTransientInputImage(image) || !image.id.startsWith('in_'))
+}
+
+function serializePersistableInputImage(image: InputImage): InputImage {
+  if (isTransientInputImage(image)) {
+    const storageStatus = image.storageStatus === 'pending' ? 'failed' : image.storageStatus
+    return {
+      id: image.id,
+      dataUrl: image.dataUrl,
+      ...(storageStatus ? { storageStatus } : {}),
+    }
+  }
+  return { id: image.id, dataUrl: '' }
+}
+
+function serializePersistableInputImages(images: InputImage[]) {
+  return images.map(serializePersistableInputImage)
+}
+
 function readStoredLocalStateForUser(userId: number): unknown {
   if (typeof localStorage === 'undefined') return undefined
 
@@ -810,13 +854,13 @@ export function getPersistedState(state: AppState) {
     ...(settings.persistInputOnRestart && (state.appMode === 'gallery' || galleryInputDraft)
       ? {
           prompt: galleryInputDraft?.prompt ?? '',
-          inputImages: galleryInputDraft?.inputImages.map((img) => ({ id: img.id, dataUrl: '' })) ?? [],
+          inputImages: serializePersistableInputImages(galleryInputDraft?.inputImages ?? []),
         }
       : {}),
     dismissedCodexCliPrompts: state.dismissedCodexCliPrompts,
     appMode: state.appMode,
     galleryInputDraft: settings.persistInputOnRestart && galleryInputDraft
-      ? { ...galleryInputDraft, inputImages: galleryInputDraft.inputImages.map((img) => ({ id: img.id, dataUrl: '' })) }
+      ? { ...galleryInputDraft, inputImages: serializePersistableInputImages(galleryInputDraft.inputImages) }
       : null,
     ...(agentConversationMigrationPending && !agentConversationPersistenceReady
       ? { agentConversations: getPersistableAgentConversations(state.agentConversations) }
@@ -1103,6 +1147,8 @@ export async function deleteImageIfUnreferenced(imageId: string) {
   forgetPendingInputStore(imageId)
   if (imageId.startsWith('pending_')) return
   if (isImageReferencedByState(useStore.getState(), imageId)) return
+  const stillUsed = await collectReferencedImageIdsForCleanup()
+  if (!stillUsed || stillUsed.has(imageId)) return
   try {
     await deleteImage(imageId)
   } catch {
@@ -1119,7 +1165,16 @@ function normalizeInputImages(value: unknown): InputImage[] {
   return value
     .map((img): InputImage | null => {
       if (!isRecord(img) || typeof img.id !== 'string') return null
-      return { id: img.id, dataUrl: typeof img.dataUrl === 'string' ? img.dataUrl : '' }
+      const storageStatus = img.storageStatus === 'pending'
+        ? 'failed'
+        : img.storageStatus === 'failed'
+        ? img.storageStatus
+        : undefined
+      return {
+        id: img.id,
+        dataUrl: typeof img.dataUrl === 'string' ? img.dataUrl : '',
+        ...(storageStatus ? { storageStatus } : {}),
+      }
     })
     .filter((img): img is InputImage => img != null)
 }
@@ -1283,7 +1338,7 @@ function getPersistableAgentInputDrafts(state: AppState) {
     if (!conversationIds.has(conversationId) || isEmptyAgentInputDraft(draft)) continue
     persistable[conversationId] = {
       ...copyAgentInputDraft(draft),
-      inputImages: draft.inputImages.map((img) => ({ id: img.id, dataUrl: '' })),
+      inputImages: serializePersistableInputImages(draft.inputImages),
     }
   }
   return persistable
@@ -1424,7 +1479,12 @@ export const useStore = create<AppState>()(
         set((s) => {
           if (idx < 0 || idx >= s.inputImages.length) return s
           const previous = s.inputImages[idx]
-          if (!previous || previous.id === img.id) return s
+          if (!previous) return s
+          if (previous.id === img.id) {
+            if (previous.dataUrl === img.dataUrl && previous.storageStatus === img.storageStatus) return s
+            const inputImages = s.inputImages.map((item, itemIdx) => itemIdx === idx ? img : item)
+            return syncActiveInputDraft(s, { inputImages })
+          }
           if (s.inputImages.some((item, itemIdx) => itemIdx !== idx && item.id === img.id)) {
             removedImageId = previous.id
             const inputImages = s.inputImages.filter((_, itemIdx) => itemIdx !== idx)
@@ -2578,17 +2638,21 @@ export async function initStore(user?: AuthUser) {
     addTaskReferencedImageIds(referencedIds, t)
   }
 
-  // 只枚举 key 清理孤立图片，避免启动时把所有 4K 原图读进内存。
-  const imageIds = await getAllImageIds()
-  const referencedImageIds: string[] = []
-  for (const imgId of imageIds) {
-    if (referencedIds.has(imgId)) {
-      referencedImageIds.push(imgId)
-    } else {
-      await deleteImage(imgId)
+  if (taskPage.nextCursor) {
+    scheduleThumbnailBackfill(Array.from(referencedIds))
+  } else {
+    // 只枚举 key 清理孤立图片，避免启动时把所有 4K 原图读进内存。
+    const imageIds = await getAllImageIds()
+    const referencedImageIds: string[] = []
+    for (const imgId of imageIds) {
+      if (referencedIds.has(imgId)) {
+        referencedImageIds.push(imgId)
+      } else {
+        await deleteImage(imgId)
+      }
     }
+    scheduleThumbnailBackfill(referencedImageIds)
   }
-  scheduleThumbnailBackfill(referencedImageIds)
 
   const restoredInputImages: InputImage[] = []
   for (const img of persistedInputImages) {
@@ -2764,7 +2828,16 @@ export async function submitTask(options: { allowFullMask?: boolean; useCurrentA
   }
 
   // 输入图像使用独立的输入命名空间，避免直接复用输出图像 ID。
-  const inputMaterialization = await materializeInputImages(orderedInputImages)
+  let inputMaterialization: Awaited<ReturnType<typeof materializeInputImages>>
+  try {
+    if (hasUnmaterializedInputImages(orderedInputImages)) {
+      showToast('正在保存参考图，完成后会提交任务', 'info')
+    }
+    inputMaterialization = await materializeInputImages(orderedInputImages)
+  } catch (err) {
+    showToast(`${getErrorToastMessage(err instanceof Error ? err.message : String(err))}，参考图已保留，请稍后重试`, 'error')
+    return
+  }
   if (Object.keys(inputMaterialization.equivalentImageIds).length) {
     orderedInputImages = inputMaterialization.images
     maskTargetImageId = remapImageId(maskTargetImageId, inputMaterialization.equivalentImageIds)
@@ -3133,14 +3206,18 @@ function addAgentReferencedImageIds(target: Set<string>, conversations = useStor
   for (const conversation of conversations) {
     for (const round of conversation.rounds) {
       for (const id of round.inputImageIds) target.add(id)
+      if (round.maskTargetImageId) target.add(round.maskTargetImageId)
       if (round.maskImageId) target.add(round.maskImageId)
     }
     for (const message of conversation.messages) {
+      for (const id of message.inputImageIds || []) target.add(id)
+      if (message.maskTargetImageId) target.add(message.maskTargetImageId)
       if (message.maskImageId) target.add(message.maskImageId)
     }
   }
   for (const draft of Object.values(inputDrafts)) {
     for (const img of draft.inputImages) target.add(img.id)
+    if (draft.maskDraft?.targetImageId) target.add(draft.maskDraft.targetImageId)
   }
 }
 
@@ -3151,6 +3228,7 @@ function addInputDraftReferencedImageIds(target: Set<string>, draft: AgentInputD
 
 function addTaskReferencedImageIds(target: Set<string>, task: TaskRecord) {
   for (const id of task.inputImageIds || []) target.add(id)
+  if (task.maskTargetImageId) target.add(task.maskTargetImageId)
   if (task.maskImageId) target.add(task.maskImageId)
   for (const id of task.outputImages || []) target.add(id)
   for (const id of task.streamPartialImageIds || []) target.add(id)
@@ -3163,16 +3241,29 @@ function addTaskCleanupImageIds(target: Set<string>, task: TaskRecord) {
   for (const id of task.streamPartialImageIds || []) target.add(id)
 }
 
+async function collectReferencedImageIdsForCleanup(localTasks: TaskRecord[] = useStore.getState().tasks) {
+  const state = useStore.getState()
+  const stillUsed = new Set<string>()
+  for (const task of localTasks) addTaskReferencedImageIds(stillUsed, task)
+  try {
+    for (const task of await getAllTasks()) addTaskReferencedImageIds(stillUsed, task)
+  } catch {
+    // Cleaning images is only an optimization. If the full task graph is unavailable,
+    // fail closed so a paginated/filtered view cannot delete an image still used elsewhere.
+    return null
+  }
+  addAgentReferencedImageIds(stillUsed, state.agentConversations, state.agentInputDrafts)
+  addInputDraftReferencedImageIds(stillUsed, state.galleryInputDraft)
+  for (const img of state.inputImages) stillUsed.add(img.id)
+  return stillUsed
+}
+
 async function deleteUnreferencedImageIds(imageIds: Iterable<string>) {
   const candidates = Array.from(new Set(Array.from(imageIds).filter(Boolean)))
   if (candidates.length === 0) return
 
-  const { tasks, inputImages, galleryInputDraft } = useStore.getState()
-  const stillUsed = new Set<string>()
-  for (const task of tasks) addTaskReferencedImageIds(stillUsed, task)
-  addAgentReferencedImageIds(stillUsed)
-  addInputDraftReferencedImageIds(stillUsed, galleryInputDraft)
-  for (const img of inputImages) stillUsed.add(img.id)
+  const stillUsed = await collectReferencedImageIdsForCleanup()
+  if (!stillUsed) return
 
   for (const imgId of candidates) {
     if (stillUsed.has(imgId)) continue
@@ -3594,7 +3685,16 @@ export async function submitAgentMessage() {
     }
   }
 
-  const inputMaterialization = await materializeInputImages(orderedInputImages)
+  let inputMaterialization: Awaited<ReturnType<typeof materializeInputImages>>
+  try {
+    if (hasUnmaterializedInputImages(orderedInputImages)) {
+      showToast('正在保存参考图，完成后会发送消息', 'info')
+    }
+    inputMaterialization = await materializeInputImages(orderedInputImages)
+  } catch (err) {
+    showToast(`${getErrorToastMessage(err instanceof Error ? err.message : String(err))}，参考图已保留，请稍后重试`, 'error')
+    return
+  }
   if (Object.keys(inputMaterialization.equivalentImageIds).length) {
     orderedInputImages = inputMaterialization.images
     maskTargetImageId = remapImageId(maskTargetImageId, inputMaterialization.equivalentImageIds)
@@ -4953,7 +5053,7 @@ export async function editOutputs(task: TaskRecord) {
 
 /** 删除多条任务 */
 export async function removeMultipleTasks(taskIds: string[]) {
-  const { tasks, setTasks, inputImages, galleryInputDraft, showToast, clearSelection, selectedTaskIds } = useStore.getState()
+  const { tasks, setTasks, showToast, selectedTaskIds } = useStore.getState()
 
   if (!taskIds.length) return
 
@@ -4974,18 +5074,13 @@ export async function removeMultipleTasks(taskIds: string[]) {
     await dbDeleteTask(id)
   }
 
-  // 找出其他任务仍引用的图片
-  const stillUsed = new Set<string>()
-  for (const t of remaining) {
-    addTaskReferencedImageIds(stillUsed, t)
-  }
-  addAgentReferencedImageIds(stillUsed)
-  addInputDraftReferencedImageIds(stillUsed, galleryInputDraft)
-  for (const img of inputImages) stillUsed.add(img.id)
+  // 找出其他任务仍引用的图片。当前列表可能是分页/筛选结果，必须查全量任务；查不到就不做物理删图。
+  const stillUsed = await collectReferencedImageIdsForCleanup(remaining)
 
   // 删除孤立的输入图、遮罩和流式临时图；缩略图保留供管理接口查看。
-  for (const imgId of deletedImageIds) {
-    if (!stillUsed.has(imgId)) {
+  if (stillUsed) {
+    for (const imgId of deletedImageIds) {
+      if (stillUsed.has(imgId)) continue
       await deleteImage(imgId)
       imageCache.delete(imgId)
     }
@@ -5002,7 +5097,7 @@ export async function removeMultipleTasks(taskIds: string[]) {
 
 /** 删除单条任务 */
 export async function removeTask(task: TaskRecord) {
-  const { tasks, setTasks, inputImages, galleryInputDraft, showToast } = useStore.getState()
+  const { tasks, setTasks, showToast } = useStore.getState()
 
   // 生成结果由后端归档保留，这里只清理输入图、遮罩和流式临时图。
   const taskImageIds = new Set<string>()
@@ -5013,18 +5108,13 @@ export async function removeTask(task: TaskRecord) {
   setTasks(remaining)
   await dbDeleteTask(task.id)
 
-  // 找出其他任务仍引用的图片
-  const stillUsed = new Set<string>()
-  for (const t of remaining) {
-    addTaskReferencedImageIds(stillUsed, t)
-  }
-  addAgentReferencedImageIds(stillUsed)
-  addInputDraftReferencedImageIds(stillUsed, galleryInputDraft)
-  for (const img of inputImages) stillUsed.add(img.id)
+  // 找出其他任务仍引用的图片。当前列表可能是分页/筛选结果，必须查全量任务；查不到就不做物理删图。
+  const stillUsed = await collectReferencedImageIdsForCleanup(remaining)
 
   // 删除孤立的输入图、遮罩和流式临时图；缩略图保留供管理接口查看。
-  for (const imgId of taskImageIds) {
-    if (!stillUsed.has(imgId)) {
+  if (stillUsed) {
+    for (const imgId of taskImageIds) {
+      if (stillUsed.has(imgId)) continue
       await deleteImage(imgId)
       imageCache.delete(imgId)
     }
@@ -5388,7 +5478,7 @@ export async function addImageFromFile(file: File): Promise<void> {
     return { id, dataUrl }
   })
   pendingInputImageStores.set(tempId, storeRequest)
-  useStore.getState().addInputImage({ id: tempId, dataUrl })
+  useStore.getState().addInputImage({ id: tempId, dataUrl, storageStatus: 'pending' })
   // 后台存储，完成后替换 ID
   void storeRequest
     .then((image) => {
@@ -5400,9 +5490,10 @@ export async function addImageFromFile(file: File): Promise<void> {
     .catch((err) => {
       const currentIdx = useStore.getState().inputImages.findIndex((img) => img.id === tempId)
       if (currentIdx >= 0 && useStore.getState().inputImages[currentIdx]?.id === tempId) {
-        useStore.getState().removeInputImage(currentIdx)
+        markInputImageStoreFailed(tempId, err)
+      } else {
+        forgetPendingInputStore(tempId)
       }
-      useStore.getState().showToast(`图片存储失败：${err instanceof Error ? err.message : String(err)}`, 'error')
     })
     .finally(() => {
       if (pendingInputImageStores.get(tempId) === storeRequest) pendingInputImageStores.delete(tempId)

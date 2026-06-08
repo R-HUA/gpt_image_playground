@@ -10,6 +10,7 @@
     "build": "tsc -b && vite build && npm run server:build",
     "server:build": "tsc -p tsconfig.server.json",
     "start": "node server/dist/index.js",
+    "restore:deleted-images": "node scripts/restore-deleted-generated-images.mjs",
     "deploy:cf": "npm run build && wrangler deploy",
     "preview": "vite preview",
     "test": "vitest run",

@@ -1387,6 +1387,8 @@ function remainingTaskUsesImage(tasks: TaskRecord[], imageId: string) {
   return tasks.some((task) => {
     if (imageIdsFromTask(task, 'outputImages').includes(imageId)) return true
     if (imageIdsFromTask(task, 'inputImageIds').includes(imageId)) return true
+    if (imageIdsFromTask(task, 'streamPartialImageIds').includes(imageId)) return true
+    if (task.maskTargetImageId === imageId) return true
     if (task.maskImageId === imageId) return true
     return false
   })
@@ -2761,6 +2763,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL) {
   }
   if (pathname === '/api/images/store') {
     assertMethod(req, 'POST')
+    const startedAt = now()
     const body = await readJsonBody<JsonRecord>(req)
     const dataUrl = asString(body.dataUrl)
     if (!dataUrl) throw Object.assign(new Error('缺少图片数据'), { statusCode: 400 })
@@ -2773,34 +2776,55 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL) {
     const existingThumbnail = getStoredFileMetadata('thumbnails', user.id, id)
     const shouldStoreThumbnail = thumbnail && asString(thumbnail.thumbnailDataUrl) && existingThumbnail?.thumbnailVersion !== thumbnailVersion
 
-    if (!existing) {
-      await putStoredFile('images', user.id, id, {
-        id,
-        dataUrl,
-        createdAt,
+    try {
+      if (!existing) {
+        await putStoredFile('images', user.id, id, {
+          id,
+          dataUrl,
+          createdAt,
+          source,
+          width: asNumber(body.width),
+          height: asNumber(body.height),
+        }, 'dataUrl')
+      } else if (asNumber(body.width) || asNumber(body.height)) {
+        updateStoredFileMetadata('images', user.id, id, {
+          width: asNumber(body.width, asNumber(existing.width)),
+          height: asNumber(body.height, asNumber(existing.height)),
+        })
+      }
+
+      if (shouldStoreThumbnail) {
+        await putStoredFile('thumbnails', user.id, id, {
+          id,
+          thumbnailDataUrl: asString(thumbnail.thumbnailDataUrl),
+          createdAt,
+          width: asNumber(thumbnail.width, asNumber(body.width)),
+          height: asNumber(thumbnail.height, asNumber(body.height)),
+          thumbnailVersion,
+        }, 'thumbnailDataUrl')
+      }
+
+      logInfo('image_store_completed', {
+        userId: user.id,
+        imageId: id,
         source,
-        width: asNumber(body.width),
-        height: asNumber(body.height),
-      }, 'dataUrl')
-    } else if (asNumber(body.width) || asNumber(body.height)) {
-      updateStoredFileMetadata('images', user.id, id, {
-        width: asNumber(body.width, asNumber(existing.width)),
-        height: asNumber(body.height, asNumber(existing.height)),
+        isNew: !existing,
+        thumbnailStored: Boolean(shouldStoreThumbnail),
+        elapsedMs: now() - startedAt,
       })
+      return sendJson(res, 200, { id, isNew: !existing })
+    } catch (err) {
+      logError('image_store_failed', {
+        userId: user.id,
+        imageId: id,
+        source,
+        isNew: !existing,
+        thumbnailStored: Boolean(shouldStoreThumbnail),
+        elapsedMs: now() - startedAt,
+        error: serializeErrorForLog(err),
+      })
+      throw err
     }
-
-    if (shouldStoreThumbnail) {
-      await putStoredFile('thumbnails', user.id, id, {
-        id,
-        thumbnailDataUrl: asString(thumbnail.thumbnailDataUrl),
-        createdAt,
-        width: asNumber(thumbnail.width, asNumber(body.width)),
-        height: asNumber(thumbnail.height, asNumber(body.height)),
-        thumbnailVersion,
-      }, 'thumbnailDataUrl')
-    }
-
-    return sendJson(res, 200, { id, isNew: !existing })
   }
   if (pathname === '/api/images') {
     if (req.method === 'GET') return sendJson(res, 200, await listStoredFiles('images', user.id))
@@ -2826,6 +2850,10 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL) {
       return sendJson(res, 200, { id })
     }
     if (req.method === 'DELETE') {
+      if (remainingTaskUsesImage(getActiveTasksForUser(user.id), id)) {
+        logInfo('image_delete_skipped_still_referenced', { userId: user.id, imageId: id })
+        return sendNoContent(res)
+      }
       const archiveResult = archiveSingleDeletedImage(user.id, id)
       if (archiveResult.status === 'failed') {
         throw Object.assign(new Error('图片归档失败，已阻止删除'), { statusCode: 500 })

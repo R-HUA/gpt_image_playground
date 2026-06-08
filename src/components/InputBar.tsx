@@ -1671,12 +1671,20 @@ export default function InputBar() {
   const renderImageThumb = (img: (typeof inputImages)[number], idx: number) => {
     const isMaskTarget = maskDraft?.targetImageId === img.id
     const canEdit = !maskTargetImage || isMaskTarget
-    const imageHintText = isMaskTarget ? '遮罩图必须为第一张图' : ''
+    const imageHintText = img.storageStatus === 'pending'
+      ? '参考图正在保存'
+      : img.storageStatus === 'failed'
+      ? '参考图保存失败，提交时会重试'
+      : isMaskTarget
+      ? '遮罩图必须为第一张图'
+      : ''
     const displaySrc = isMaskTarget && maskPreviewUrl ? maskPreviewUrl : img.dataUrl
     const isImageDragging = imageDragIndex === idx
     const isLast = idx === inputImages.length - 1
     const showDropBefore = imageDragOverIndex === idx && imageDragIndex !== idx
     const showDropAfter = imageDragOverIndex === inputImages.length && isLast && imageDragIndex !== idx
+    const isImageStoragePending = img.storageStatus === 'pending'
+    const isImageStorageFailed = img.storageStatus === 'failed'
 
     const handleDragStart = (e: React.DragEvent) => {
       if (isMaskTarget) {
@@ -1816,7 +1824,11 @@ export default function InputBar() {
         }}
       >
         <ButtonTooltip
-          visible={imageHintId === img.id && Boolean(imageHintText) && (!isMobile || isMaskTarget)}
+          visible={
+            imageHintId === img.id &&
+            Boolean(imageHintText) &&
+            (!isMobile || isMaskTarget || isImageStoragePending || isImageStorageFailed)
+          }
           text={imageHintText}
         />
         {showDropBefore && (
@@ -1856,6 +1868,13 @@ export default function InputBar() {
           {isMaskTarget && (
             <span className="absolute left-1 top-1 rounded bg-blue-500/90 px-1.5 py-0.5 text-[8px] leading-none text-white font-bold tracking-wider backdrop-blur-sm z-10 pointer-events-none">
               MASK
+            </span>
+          )}
+          {(isImageStoragePending || isImageStorageFailed) && (
+            <span className={`absolute left-1 top-1 rounded px-1.5 py-0.5 text-[8px] leading-none text-white font-bold tracking-wider backdrop-blur-sm z-10 pointer-events-none ${
+              isImageStoragePending ? 'bg-amber-500/90' : 'bg-red-500/90'
+            }`}>
+              {isImageStoragePending ? '保存中' : '待重试'}
             </span>
           )}
           <span className="absolute bottom-1 left-1 flex h-4 w-4 items-center justify-center rounded-full bg-black/55 text-[9px] font-semibold text-white backdrop-blur-sm z-10 pointer-events-none">

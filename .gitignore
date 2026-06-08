@@ -2,7 +2,12 @@ node_modules/
 dist/
 server/dist/
 data/
+.env
+.env.*
+!.env.*.example
 config/users.json
 dev-proxy.config.json
 .wrangler/
 .qoder/
+.vscode/
+result.md

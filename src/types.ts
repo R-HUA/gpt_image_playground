@@ -129,6 +129,8 @@ export interface InputImage {
   id: string
   /** data URL，用于预览 */
   dataUrl: string
+  /** 临时上传状态；正式入库后为空 */
+  storageStatus?: 'pending' | 'failed'
 }
 
 export interface MaskDraft {

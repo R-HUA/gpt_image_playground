@@ -10,11 +10,19 @@ vi.mock('./lib/db', () => {
   const thumbnails = new Map<string, StoredImageThumbnail>()
   const agentConversations = new Map<string, AgentConversation>()
   let imageSeq = 0
+  let listTasksPage: { items: TaskRecord[]; nextCursor?: string } | null = null
+  let storeImageError: Error | null = null
 
   return {
     CURRENT_THUMBNAIL_VERSION: 2,
     getAllTasks: async () => [...tasks.values()],
-    listTasks: async () => ({ items: [...tasks.values()], nextCursor: undefined }),
+    listTasks: async () => listTasksPage ?? { items: [...tasks.values()], nextCursor: undefined },
+    __setMockListTasksPage: (page: { items: TaskRecord[]; nextCursor?: string } | null) => {
+      listTasksPage = page
+    },
+    __setMockStoreImageError: (err: Error | null) => {
+      storeImageError = err
+    },
     getTask: async (id: string) => tasks.get(id) ?? null,
     getIncompleteTasks: async () => [...tasks.values()].filter((task) => task.status === 'queued' || task.status === 'running'),
     putTask: async (task: TaskRecord) => {
@@ -64,6 +72,7 @@ vi.mock('./lib/db', () => {
       thumbnails.clear()
     },
     storeImage: async (dataUrl: string, source: StoredImage['source'] = 'upload') => {
+      if (storeImageError) throw storeImageError
       const existing = [...images.values()].find((image) => image.dataUrl === dataUrl && image.source === source)
       if (existing) return existing.id
       const id = `stored-${source}-${++imageSeq}`
@@ -112,9 +121,10 @@ vi.mock('./lib/agentApi', () => ({
   }),
 }))
 import { clearAgentConversations, clearImages, clearTasks, getAllAgentConversations, getAllImageIds, getAllTasks, putAgentConversation, putImage, putTask as putDbTask } from './lib/db'
+import * as dbModule from './lib/db'
 import { backendGeneration } from './lib/backendApi'
 import { callAgentResponsesApi, callBatchImageSingle } from './lib/agentApi'
-import { cleanStaleAgentInputDrafts, deleteAgentRoundFromConversation, deleteFavoriteCollection, editOutputs, getActiveAgentRounds, getErrorToastMessage, getPersistedState, getTaskApiProfile, importData, initStore, markInterruptedOpenAIRunningTasks, migratePersistedState, regenerateAgentAssistantMessage, remapAgentRoundMentionsForPathChange, removeMultipleTasks, removeTask, reuseConfig, submitAgentMessage, submitTask, useStore } from './store'
+import { addImageFromFile, cleanStaleAgentInputDrafts, deleteAgentRoundFromConversation, deleteFavoriteCollection, deleteImageIfUnreferenced, editOutputs, getActiveAgentRounds, getErrorToastMessage, getPersistedState, getTaskApiProfile, importData, initStore, markInterruptedOpenAIRunningTasks, migratePersistedState, regenerateAgentAssistantMessage, remapAgentRoundMentionsForPathChange, removeMultipleTasks, removeTask, reuseConfig, submitAgentMessage, submitTask, useStore } from './store'
 
 const imageA = { id: 'image-a', dataUrl: 'data:image/png;base64,a' }
 const imageB = { id: 'image-b', dataUrl: 'data:image/png;base64,b' }
@@ -220,6 +230,8 @@ describe('favorite collection deletion', () => {
 
 describe('mask draft lifecycle in store actions', () => {
   beforeEach(() => {
+    ;(dbModule as unknown as { __setMockStoreImageError: (err: Error | null) => void }).__setMockStoreImageError(null)
+    vi.mocked(backendGeneration.createTask).mockClear()
     useStore.setState({
       settings: { ...DEFAULT_SETTINGS, apiKey: 'test-key' },
       prompt: 'prompt',
@@ -292,6 +304,94 @@ describe('mask draft lifecycle in store actions', () => {
     expect(state.tasks[0].status).toBe('queued')
     expect(backendGeneration.createTask).toHaveBeenCalled()
     expect(state.showToast).toHaveBeenCalledWith('任务已提交队列', 'success')
+  })
+
+  it('keeps uploaded image in input when background storage fails', async () => {
+    const error = new Error('network failed')
+    ;(dbModule as unknown as { __setMockStoreImageError: (err: Error | null) => void }).__setMockStoreImageError(error)
+    vi.stubGlobal('FileReader', class {
+      result: string | null = null
+      onload: (() => void) | null = null
+      onerror: (() => void) | null = null
+      readAsDataURL() {
+        this.result = imageA.dataUrl
+        queueMicrotask(() => this.onload?.())
+      }
+    })
+    const file = new File(['image'], 'test.png', { type: 'image/png' })
+
+    try {
+      await addImageFromFile(file)
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    } finally {
+      vi.unstubAllGlobals()
+    }
+
+    const state = useStore.getState()
+    expect(state.inputImages).toHaveLength(1)
+    expect(state.inputImages[0].id).toMatch(/^pending_/)
+    expect(state.inputImages[0]).toMatchObject({ dataUrl: imageA.dataUrl, storageStatus: 'failed' })
+    expect(state.showToast).toHaveBeenCalledWith(expect.stringContaining('图片存储失败'), 'error')
+  })
+
+  it('persists failed pending uploads with their preview data so refresh does not drop them', () => {
+    const pendingImage = { id: 'pending_upload', dataUrl: imageA.dataUrl, storageStatus: 'failed' as const }
+    useStore.setState({ inputImages: [pendingImage] })
+
+    const persisted = getPersistedState(useStore.getState())
+
+    expect(persisted.inputImages).toEqual([pendingImage])
+  })
+
+  it('marks persisted in-flight uploads as retryable after refresh', () => {
+    useStore.setState({
+      inputImages: [{ id: 'pending_uploading', dataUrl: imageA.dataUrl, storageStatus: 'pending' }],
+    })
+
+    const persisted = getPersistedState(useStore.getState())
+
+    expect(persisted.inputImages).toEqual([{
+      id: 'pending_uploading',
+      dataUrl: imageA.dataUrl,
+      storageStatus: 'failed',
+    }])
+    expect(migratePersistedState({ inputImages: persisted.inputImages })).toMatchObject({
+      inputImages: [{
+        id: 'pending_uploading',
+        dataUrl: imageA.dataUrl,
+        storageStatus: 'failed',
+      }],
+    })
+  })
+
+  it('does not submit a task when reference image storage fails', async () => {
+    const error = new Error('network failed')
+    ;(dbModule as unknown as { __setMockStoreImageError: (err: Error | null) => void }).__setMockStoreImageError(error)
+    useStore.setState({ inputImages: [{ id: 'out_reference', dataUrl: imageA.dataUrl }] })
+
+    await submitTask()
+
+    expect(backendGeneration.createTask).not.toHaveBeenCalled()
+    expect(useStore.getState().tasks).toHaveLength(0)
+    expect(useStore.getState().inputImages).toHaveLength(1)
+    expect(useStore.getState().showToast).toHaveBeenCalledWith(expect.stringContaining('参考图已保留'), 'error')
+  })
+
+  it('retries a failed pending upload when submitting', async () => {
+    useStore.setState({
+      inputImages: [{ id: 'pending_retry', dataUrl: imageA.dataUrl, storageStatus: 'failed' }],
+    })
+
+    await submitTask()
+
+    const state = useStore.getState()
+    expect(backendGeneration.createTask).toHaveBeenCalled()
+    expect(state.inputImages).toHaveLength(1)
+    expect(state.inputImages[0].id).toMatch(/^stored-upload-/)
+    expect(state.inputImages[0].storageStatus).toBeUndefined()
+    const [, request] = vi.mocked(backendGeneration.createTask).mock.calls[0]
+    expect(request.inputImageIds).toEqual([state.inputImages[0].id])
+    expect(state.showToast).toHaveBeenCalledWith('正在保存参考图，完成后会提交任务', 'info')
   })
 
   it('preserves selected image mentions when replacing a mask target with an equivalent image id', () => {
@@ -452,6 +552,28 @@ describe('agent conversation persistence', () => {
     const serializedStoredTasks = JSON.stringify(storedTasks)
     expect(serializedStoredTasks).toContain('image_generation_call')
     expect(serializedStoredTasks).not.toContain('legacy-task-base64')
+  })
+
+  it('does not delete images referenced by unloaded paginated tasks during startup cleanup', async () => {
+    await clearTasks()
+    await clearImages()
+    const firstPageTask = task({ id: 'first-page-task', createdAt: 2, outputImages: ['first-page-output'] })
+    const nextPageTask = task({ id: 'next-page-task', createdAt: 1, outputImages: ['next-page-output'] })
+    await putDbTask(firstPageTask)
+    await putDbTask(nextPageTask)
+    await putImage({ id: 'first-page-output', dataUrl: 'data:image/png;base64,first', source: 'generated' })
+    await putImage({ id: 'next-page-output', dataUrl: 'data:image/png;base64,next', source: 'generated' })
+    ;(dbModule as unknown as { __setMockListTasksPage: (page: { items: TaskRecord[]; nextCursor?: string } | null) => void })
+      .__setMockListTasksPage({ items: [firstPageTask], nextCursor: 'next-page' })
+
+    try {
+      await initStore()
+
+      expect(new Set(await getAllImageIds())).toEqual(new Set(['first-page-output', 'next-page-output']))
+    } finally {
+      ;(dbModule as unknown as { __setMockListTasksPage: (page: { items: TaskRecord[]; nextCursor?: string } | null) => void })
+        .__setMockListTasksPage(null)
+    }
   })
 
   it('keeps agent conversations created while initStore is loading', async () => {
@@ -1204,6 +1326,34 @@ describe('agent context for removed outputs', () => {
     expect(await getAllImageIds()).toEqual(['out_keep'])
   })
 
+  it('keeps cleanup images referenced by unloaded tasks when deleting a task', async () => {
+    await clearTasks()
+    await clearImages()
+    await putImage({ id: 'shared-input', dataUrl: 'data:image/png;base64,input', source: 'upload' })
+    const deletedTask = task({
+      id: 'loaded-task-delete',
+      inputImageIds: ['shared-input'],
+    })
+    const unloadedTask = task({
+      id: 'unloaded-task-keep',
+      inputImageIds: ['shared-input'],
+    })
+    await putDbTask(deletedTask)
+    await putDbTask(unloadedTask)
+    useStore.setState({
+      tasks: [deletedTask],
+      inputImages: [],
+      galleryInputDraft: null,
+      agentConversations: [],
+      agentInputDrafts: {},
+      showToast: vi.fn(),
+    })
+
+    await removeTask(deletedTask)
+
+    expect(await getAllImageIds()).toEqual(['shared-input'])
+  })
+
   it('keeps generated outputs but removes unreferenced inputs when deleting multiple tasks', async () => {
     await clearImages()
     await putImage({ id: 'input-batch-delete', dataUrl: 'data:image/png;base64,input', source: 'upload' })
@@ -1225,6 +1375,27 @@ describe('agent context for removed outputs', () => {
     await removeMultipleTasks([deletedTask.id])
 
     expect(await getAllImageIds()).toEqual(['out_batch_keep'])
+  })
+
+  it('keeps images referenced only by persisted tasks when checking unreferenced cleanup', async () => {
+    await clearTasks()
+    await clearImages()
+    await putImage({ id: 'persisted-only-input', dataUrl: 'data:image/png;base64,input', source: 'upload' })
+    await putDbTask(task({
+      id: 'persisted-task',
+      inputImageIds: ['persisted-only-input'],
+    }))
+    useStore.setState({
+      tasks: [],
+      inputImages: [],
+      galleryInputDraft: null,
+      agentConversations: [],
+      agentInputDrafts: {},
+    })
+
+    await deleteImageIfUnreferenced('persisted-only-input')
+
+    expect(await getAllImageIds()).toEqual(['persisted-only-input'])
   })
 
   it('restores stripped image_generation results from task payloads when building context', async () => {
