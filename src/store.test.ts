@@ -13,6 +13,7 @@ vi.mock('./lib/db', () => {
   let listTasksPage: { items: TaskRecord[]; nextCursor?: string } | null = null
   let storeImageError: Error | null = null
   let storeImageCount = 0
+  let getAllAgentConversationsCount = 0
 
   return {
     CURRENT_THUMBNAIL_VERSION: 2,
@@ -25,6 +26,10 @@ vi.mock('./lib/db', () => {
       storeImageError = err
     },
     __getMockStoreImageCount: () => storeImageCount,
+    __getMockGetAllAgentConversationsCount: () => getAllAgentConversationsCount,
+    __resetMockGetAllAgentConversationsCount: () => {
+      getAllAgentConversationsCount = 0
+    },
     getTask: async (id: string) => tasks.get(id) ?? null,
     getIncompleteTasks: async () => [...tasks.values()].filter((task) => task.status === 'queued' || task.status === 'running'),
     putTask: async (task: TaskRecord) => {
@@ -37,7 +42,10 @@ vi.mock('./lib/db', () => {
     clearTasks: async () => {
       tasks.clear()
     },
-    getAllAgentConversations: async () => [...agentConversations.values()],
+    getAllAgentConversations: async () => {
+      getAllAgentConversationsCount++
+      return [...agentConversations.values()]
+    },
     putAgentConversation: async (conversation: AgentConversation) => {
       agentConversations.set(conversation.id, conversation)
       return conversation.id
@@ -478,6 +486,7 @@ describe('input persistence setting', () => {
 describe('agent conversation persistence', () => {
   beforeEach(async () => {
     await clearAgentConversations()
+    ;(dbModule as unknown as { __resetMockGetAllAgentConversationsCount: () => void }).__resetMockGetAllAgentConversationsCount()
   })
 
   it('omits agent conversations from localStorage state', () => {
@@ -521,7 +530,7 @@ describe('agent conversation persistence', () => {
     const storedConversation = agentConversation({ id: 'stored-conversation', createdAt: 1, updatedAt: 1 })
     const legacyConversation = agentConversation({ id: 'legacy-conversation', createdAt: 2, updatedAt: 2 })
     await putAgentConversation(storedConversation)
-    useStore.setState({ agentConversations: [legacyConversation], activeAgentConversationId: legacyConversation.id })
+    useStore.setState({ appMode: 'agent', agentConversations: [legacyConversation], activeAgentConversationId: legacyConversation.id })
 
     await initStore()
 
@@ -530,6 +539,27 @@ describe('agent conversation persistence', () => {
     expect(state.agentConversations.map((conversation) => conversation.id)).toEqual(['stored-conversation', 'legacy-conversation'])
     expect(state.activeAgentConversationId).toBe('legacy-conversation')
     expect(stored.map((conversation) => conversation.id)).toEqual(['stored-conversation', 'legacy-conversation'])
+  })
+
+  it('defers loading stored agent conversations while starting in gallery mode', async () => {
+    const storedConversation = agentConversation({ id: 'stored-conversation', createdAt: 1, updatedAt: 1 })
+    useStore.setState({
+      appMode: 'gallery',
+      agentConversations: [],
+      agentConversationsLoaded: false,
+      activeAgentConversationId: null,
+    })
+    await putAgentConversation(storedConversation)
+
+    await initStore()
+
+    expect((dbModule as unknown as { __getMockGetAllAgentConversationsCount: () => number }).__getMockGetAllAgentConversationsCount()).toBe(0)
+    expect(useStore.getState().agentConversations).toEqual([])
+
+    await useStore.getState().loadAgentConversations()
+
+    expect((dbModule as unknown as { __getMockGetAllAgentConversationsCount: () => number }).__getMockGetAllAgentConversationsCount()).toBe(1)
+    expect(useStore.getState().agentConversations.map((conversation) => conversation.id)).toEqual(['stored-conversation'])
   })
 
   it('strips generated image payloads from legacy task raw payloads during startup migration', async () => {
@@ -574,7 +604,7 @@ describe('agent conversation persistence', () => {
   it('keeps agent conversations created while initStore is loading', async () => {
     const legacyConversation = agentConversation({ id: 'legacy-conversation', createdAt: 1, updatedAt: 1 })
     const earlyConversation = agentConversation({ id: 'early-conversation', createdAt: 2, updatedAt: 2 })
-    useStore.setState({ agentConversations: [legacyConversation], activeAgentConversationId: legacyConversation.id })
+    useStore.setState({ appMode: 'agent', agentConversations: [legacyConversation], activeAgentConversationId: legacyConversation.id })
 
     const initPromise = initStore()
     useStore.setState({ agentConversations: [legacyConversation, earlyConversation], activeAgentConversationId: earlyConversation.id })

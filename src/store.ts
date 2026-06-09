@@ -74,7 +74,6 @@ const thumbnailSubscribers = new Map<string, Set<(thumbnail: { dataUrl: string; 
 let thumbnailBackfillScheduled = false
 const MAX_IMAGE_CACHE_ENTRIES = 8
 const MAX_THUMBNAIL_CACHE_ENTRIES = 80
-const MAX_THUMBNAIL_BACKFILL_CONCURRENT = 4
 const FAL_RECOVERY_POLL_MS = 10_000
 const CUSTOM_RECOVERY_POLL_MS = 10_000
 const SUPPORT_PROMPT_IMAGE_THRESHOLD = 50
@@ -314,15 +313,9 @@ async function processNextThumbnailBackfill() {
 }
 
 async function getNextThumbnailBackfillBatch() {
-  const candidates = getOrderedThumbnailBackfillIds().slice(0, MAX_THUMBNAIL_BACKFILL_CONCURRENT)
+  const candidates = getOrderedThumbnailBackfillIds()
   if (candidates.length === 0) return []
-
-  const sizes = await Promise.all(candidates.map(async (id) => {
-    const image = await getImage(id)
-    return { width: image?.width, height: image?.height }
-  }))
-  const concurrency = getThumbnailConcurrencyForBatch(sizes)
-  const selected = candidates.slice(0, concurrency)
+  const selected = candidates.slice(0, 1)
   for (const id of selected) thumbnailBackfillIds.delete(id)
   return selected
 }
@@ -335,19 +328,6 @@ function getOrderedThumbnailBackfillIds() {
     else background.push(id)
   }
   return [...visible, ...background]
-}
-
-function getThumbnailConcurrencyForBatch(sizes: Array<{ width?: number; height?: number }>) {
-  let maxMegapixels = 0
-  for (const { width, height } of sizes) {
-    if (!width || !height) return 1
-    maxMegapixels = Math.max(maxMegapixels, (width * height) / 1_000_000)
-  }
-  const megapixels = maxMegapixels
-  if (megapixels >= 8) return 1
-  if (megapixels >= 4) return 2
-  if (megapixels >= 2) return 3
-  return 4
 }
 
 function startThumbnailBackfill(id: string) {
@@ -1011,6 +991,7 @@ interface AppState {
   agentEditingConversationId: string | null
   agentGeneratingTitleIds: Record<string, true>
   createAgentConversation: () => string
+  loadAgentConversations: () => Promise<void>
   setActiveAgentConversationId: (id: string | null) => void
   setActiveAgentRoundId: (conversationId: string, roundId: string | null) => void
   renameAgentConversation: (id: string, title: string) => void
@@ -1379,6 +1360,7 @@ export const useStore = create<AppState>()(
             selectedFavoriteCollectionIds: [],
             ...restoreAgentInputDraftState(state.agentInputDrafts, state.activeAgentConversationId),
           }))
+          if (!get().agentConversationsLoaded) void get().loadAgentConversations()
           return
         }
 
@@ -1610,6 +1592,19 @@ export const useStore = create<AppState>()(
       agentEditingRoundId: null,
       agentEditingConversationId: null,
       agentGeneratingTitleIds: {},
+      loadAgentConversations: async () => {
+        if (get().agentConversationsLoaded) return
+        await loadAgentConversationsFromServer()
+        const shouldRewritePersistedLocalState = agentConversationMigrationPending
+        agentConversationPersistenceReady = true
+        agentConversationMigrationPending = false
+        if (agentConversationPersistQueued || useStore.getState().agentConversations !== lastStoredAgentConversations) {
+          await flushAgentConversationsToIndexedDB()
+        }
+        if (shouldRewritePersistedLocalState) {
+          useStore.setState({})
+        }
+      },
       createAgentConversation: () => {
         const now = Date.now()
         const latestConversation = getLatestAgentConversation(get().agentConversations)
@@ -2027,6 +2022,35 @@ function getPersistableTask(task: TaskRecord): TaskRecord {
 
 function putTask(task: TaskRecord): Promise<IDBValidKey> {
   return dbPutTask(getPersistableTask(task))
+}
+
+async function loadAgentConversationsFromServer() {
+  const legacyAgentConversations = normalizeAgentConversations(useStore.getState().agentConversations)
+  const storedAgentConversations = normalizeAgentConversations(await getAllAgentConversations())
+  let loadedAgentConversations = mergeAgentConversationsForStorage(storedAgentConversations, legacyAgentConversations)
+  const currentAgentConversations = normalizeAgentConversations(useStore.getState().agentConversations)
+  loadedAgentConversations = mergeAgentConversationsForStorage(loadedAgentConversations, currentAgentConversations)
+  const activeAgentConversationId = useStore.getState().activeAgentConversationId && loadedAgentConversations.some((conversation) => conversation.id === useStore.getState().activeAgentConversationId)
+    ? useStore.getState().activeAgentConversationId
+    : loadedAgentConversations[0]?.id ?? null
+  if (loadedAgentConversations.length > 0 || legacyAgentConversations.length > 0) {
+    useStore.setState((state) => {
+      const agentInputDrafts = cleanStaleAgentInputDrafts(
+        normalizeAgentInputDrafts(state.agentInputDrafts, loadedAgentConversations),
+        activeAgentConversationId,
+      )
+      return {
+        agentConversations: loadedAgentConversations,
+        agentConversationsLoaded: true,
+        activeAgentConversationId,
+        agentInputDrafts,
+        ...(state.appMode === 'agent' ? restoreAgentInputDraftState(agentInputDrafts, activeAgentConversationId) : {}),
+      }
+    })
+    await replaceStoredAgentConversations(loadedAgentConversations)
+  } else {
+    useStore.setState({ agentConversationsLoaded: true })
+  }
 }
 
 function mergeTasksById(current: TaskRecord[], incoming: TaskRecord[], mode: 'replace-page' | 'prepend' | 'append' = 'prepend') {
@@ -2536,42 +2560,20 @@ export async function initStore(user?: AuthUser) {
   }
   backendSettingsPersistenceReady = true
 
-  const legacyAgentConversations = normalizeAgentConversations(useStore.getState().agentConversations)
   const [taskPage, incompleteTasks] = await Promise.all([
     listTasks({ limit: 50 }),
     getIncompleteTasks(),
   ])
   const storedTasks = mergeTasksById(taskPage.items, incompleteTasks, 'prepend')
   useStore.setState({ taskNextCursor: taskPage.nextCursor ?? null })
-  const storedAgentConversations = normalizeAgentConversations(await getAllAgentConversations())
-  let loadedAgentConversations = mergeAgentConversationsForStorage(storedAgentConversations, legacyAgentConversations)
-  const currentAgentConversations = normalizeAgentConversations(useStore.getState().agentConversations)
-  loadedAgentConversations = mergeAgentConversationsForStorage(loadedAgentConversations, currentAgentConversations)
-  const activeAgentConversationId = useStore.getState().activeAgentConversationId && loadedAgentConversations.some((conversation) => conversation.id === useStore.getState().activeAgentConversationId)
-    ? useStore.getState().activeAgentConversationId
-    : loadedAgentConversations[0]?.id ?? null
-  if (loadedAgentConversations.length > 0 || legacyAgentConversations.length > 0) {
-    useStore.setState((state) => {
-      const agentInputDrafts = cleanStaleAgentInputDrafts(
-        normalizeAgentInputDrafts(state.agentInputDrafts, loadedAgentConversations),
-        activeAgentConversationId,
-      )
-      return {
-        agentConversations: loadedAgentConversations,
-        agentConversationsLoaded: true,
-        activeAgentConversationId,
-        agentInputDrafts,
-        ...(state.appMode === 'agent' ? restoreAgentInputDraftState(agentInputDrafts, activeAgentConversationId) : {}),
-      }
-    })
-    await replaceStoredAgentConversations(loadedAgentConversations)
-  } else {
-    useStore.setState({ agentConversationsLoaded: true })
+  const shouldLoadAgentConversations = useStore.getState().appMode === 'agent' || agentConversationMigrationPending
+  if (shouldLoadAgentConversations) {
+    await loadAgentConversationsFromServer()
   }
   const shouldRewritePersistedLocalState = agentConversationMigrationPending
-  agentConversationPersistenceReady = true
+  agentConversationPersistenceReady = shouldLoadAgentConversations
   agentConversationMigrationPending = false
-  if (agentConversationPersistQueued || useStore.getState().agentConversations !== lastStoredAgentConversations) {
+  if (shouldLoadAgentConversations && (agentConversationPersistQueued || useStore.getState().agentConversations !== lastStoredAgentConversations)) {
     await flushAgentConversationsToIndexedDB()
   }
   if (shouldRewritePersistedLocalState) {
@@ -2634,20 +2636,14 @@ export async function initStore(user?: AuthUser) {
     addTaskReferencedImageIds(referencedIds, t)
   }
 
-  if (taskPage.nextCursor) {
-    scheduleThumbnailBackfill(Array.from(referencedIds))
-  } else {
+  if (!taskPage.nextCursor && state.agentConversationsLoaded) {
     // 只枚举 key 清理孤立图片，避免启动时把所有 4K 原图读进内存。
     const imageIds = await getAllImageIds()
-    const referencedImageIds: string[] = []
     for (const imgId of imageIds) {
-      if (referencedIds.has(imgId)) {
-        referencedImageIds.push(imgId)
-      } else {
+      if (!referencedIds.has(imgId)) {
         await deleteImage(imgId)
       }
     }
-    scheduleThumbnailBackfill(referencedImageIds)
   }
 
   const restoredInputImages: InputImage[] = []
@@ -5435,7 +5431,6 @@ export async function importData(file: File, options: ImportOptions = { importCo
       })
       await replaceStoredAgentConversations(useStore.getState().agentConversations)
       skipSupportPromptForImportedData(tasks)
-      scheduleThumbnailBackfill(importedImageIds)
     }
 
     if (options.importConfig && data.settings) {
