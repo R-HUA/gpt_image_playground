@@ -12,6 +12,7 @@ vi.mock('./lib/db', () => {
   let imageSeq = 0
   let listTasksPage: { items: TaskRecord[]; nextCursor?: string } | null = null
   let storeImageError: Error | null = null
+  let storeImageCount = 0
 
   return {
     CURRENT_THUMBNAIL_VERSION: 2,
@@ -23,6 +24,7 @@ vi.mock('./lib/db', () => {
     __setMockStoreImageError: (err: Error | null) => {
       storeImageError = err
     },
+    __getMockStoreImageCount: () => storeImageCount,
     getTask: async (id: string) => tasks.get(id) ?? null,
     getIncompleteTasks: async () => [...tasks.values()].filter((task) => task.status === 'queued' || task.status === 'running'),
     putTask: async (task: TaskRecord) => {
@@ -72,6 +74,7 @@ vi.mock('./lib/db', () => {
       thumbnails.clear()
     },
     storeImage: async (dataUrl: string, source: StoredImage['source'] = 'upload') => {
+      storeImageCount++
       if (storeImageError) throw storeImageError
       const existing = [...images.values()].find((image) => image.dataUrl === dataUrl && image.source === source)
       if (existing) return existing.id
@@ -128,6 +131,8 @@ import { addImageFromFile, cleanStaleAgentInputDrafts, deleteAgentRoundFromConve
 
 const imageA = { id: 'image-a', dataUrl: 'data:image/png;base64,a' }
 const imageB = { id: 'image-b', dataUrl: 'data:image/png;base64,b' }
+const storedImageA = { ...imageA, id: 'in_image-a' }
+const storedImageB = { ...imageB, id: 'in_image-b' }
 
 describe('error toast messages', () => {
   it('drops long error detail after the failure title', () => {
@@ -306,9 +311,8 @@ describe('mask draft lifecycle in store actions', () => {
     expect(state.showToast).toHaveBeenCalledWith('任务已提交队列', 'success')
   })
 
-  it('keeps uploaded image in input when background storage fails', async () => {
-    const error = new Error('network failed')
-    ;(dbModule as unknown as { __setMockStoreImageError: (err: Error | null) => void }).__setMockStoreImageError(error)
+  it('adds file uploads as transient previews without storing them immediately', async () => {
+    const storeCountBefore = (dbModule as unknown as { __getMockStoreImageCount: () => number }).__getMockStoreImageCount()
     vi.stubGlobal('FileReader', class {
       result: string | null = null
       onload: (() => void) | null = null
@@ -322,45 +326,36 @@ describe('mask draft lifecycle in store actions', () => {
 
     try {
       await addImageFromFile(file)
-      await new Promise((resolve) => setTimeout(resolve, 0))
     } finally {
       vi.unstubAllGlobals()
     }
 
     const state = useStore.getState()
     expect(state.inputImages).toHaveLength(1)
+    expect(state.inputImages[0]).toMatchObject({ dataUrl: imageA.dataUrl })
     expect(state.inputImages[0].id).toMatch(/^pending_/)
-    expect(state.inputImages[0]).toMatchObject({ dataUrl: imageA.dataUrl, storageStatus: 'failed' })
-    expect(state.showToast).toHaveBeenCalledWith(expect.stringContaining('图片存储失败'), 'error')
+    expect((dbModule as unknown as { __getMockStoreImageCount: () => number }).__getMockStoreImageCount()).toBe(storeCountBefore)
   })
 
-  it('persists failed pending uploads with their preview data so refresh does not drop them', () => {
+  it('does not persist transient upload previews', () => {
     const pendingImage = { id: 'pending_upload', dataUrl: imageA.dataUrl, storageStatus: 'failed' as const }
-    useStore.setState({ inputImages: [pendingImage] })
+    useStore.setState({ inputImages: [pendingImage, { id: 'in_stored', dataUrl: imageB.dataUrl }] })
 
     const persisted = getPersistedState(useStore.getState())
 
-    expect(persisted.inputImages).toEqual([pendingImage])
+    expect(persisted.inputImages).toEqual([{ id: 'in_stored', dataUrl: '' }])
   })
 
-  it('marks persisted in-flight uploads as retryable after refresh', () => {
+  it('omits persisted in-flight upload previews after refresh', () => {
     useStore.setState({
       inputImages: [{ id: 'pending_uploading', dataUrl: imageA.dataUrl, storageStatus: 'pending' }],
     })
 
     const persisted = getPersistedState(useStore.getState())
 
-    expect(persisted.inputImages).toEqual([{
-      id: 'pending_uploading',
-      dataUrl: imageA.dataUrl,
-      storageStatus: 'failed',
-    }])
+    expect(persisted.inputImages).toEqual([])
     expect(migratePersistedState({ inputImages: persisted.inputImages })).toMatchObject({
-      inputImages: [{
-        id: 'pending_uploading',
-        dataUrl: imageA.dataUrl,
-        storageStatus: 'failed',
-      }],
+      inputImages: [],
     })
   })
 
@@ -448,7 +443,7 @@ describe('input persistence setting', () => {
       settings: { ...DEFAULT_SETTINGS },
       appMode: 'gallery',
       prompt: 'prompt',
-      inputImages: [imageA],
+      inputImages: [storedImageA],
       galleryInputDraft: null,
       dismissedCodexCliPrompts: [],
     })
@@ -458,7 +453,7 @@ describe('input persistence setting', () => {
     const persisted = getPersistedState(useStore.getState())
 
     expect(persisted.prompt).toBe('prompt')
-    expect(persisted.inputImages).toEqual([{ id: imageA.id, dataUrl: '' }])
+    expect(persisted.inputImages).toEqual([{ id: storedImageA.id, dataUrl: '' }])
   })
 
   it('omits input when restart input restore is disabled', () => {
@@ -1031,13 +1026,13 @@ describe('agent draft lifecycle', () => {
   const responsesProfile = createDefaultOpenAIProfile({ id: 'openai-responses', apiKey: 'openai-key', apiMode: 'responses' })
   const draftState = {
     prompt: `参考 ${getSelectedImageMentionLabel(0)} 生成`,
-    inputImages: [imageA],
+    inputImages: [storedImageA],
     maskDraft: {
-      targetImageId: imageA.id,
+      targetImageId: storedImageA.id,
       maskDataUrl: 'data:image/png;base64,mask',
       updatedAt: 1,
     },
-    maskEditorImageId: imageA.id,
+    maskEditorImageId: storedImageA.id,
     agentEditingRoundId: 'round-a',
   }
 
@@ -1076,7 +1071,7 @@ describe('agent draft lifecycle', () => {
       prompt: draftState.prompt,
       inputImages: draftState.inputImages,
       maskDraft: draftState.maskDraft,
-      maskEditorImageId: imageA.id,
+      maskEditorImageId: storedImageA.id,
     })
   })
 
@@ -1089,7 +1084,7 @@ describe('agent draft lifecycle', () => {
     expect(state.prompt).toBe(draftState.prompt)
     expect(state.inputImages).toEqual(draftState.inputImages)
     expect(state.maskDraft).toEqual(draftState.maskDraft)
-    expect(state.maskEditorImageId).toBe(imageA.id)
+    expect(state.maskEditorImageId).toBe(storedImageA.id)
     expect(state.agentEditingRoundId).toBeNull()
   })
 
@@ -1107,7 +1102,7 @@ describe('agent draft lifecycle', () => {
           prompt: draftState.prompt,
           inputImages: draftState.inputImages,
           maskDraft: draftState.maskDraft,
-          maskEditorImageId: imageA.id,
+          maskEditorImageId: storedImageA.id,
         },
       },
     })
@@ -1133,7 +1128,7 @@ describe('agent draft lifecycle', () => {
       appMode: 'agent',
       galleryInputDraft: {
         prompt: galleryPrompt,
-        inputImages: [imageB],
+        inputImages: [storedImageB],
         maskDraft: null,
         maskEditorImageId: null,
       },
@@ -1142,7 +1137,7 @@ describe('agent draft lifecycle', () => {
     const persisted = getPersistedState(useStore.getState())
 
     expect(persisted.prompt).toBe(galleryPrompt)
-    expect(persisted.inputImages).toEqual([{ id: imageB.id, dataUrl: '' }])
+    expect(persisted.inputImages).toEqual([{ id: storedImageB.id, dataUrl: '' }])
   })
 
   it('clears stale mentions in the visible input when switching conversations', () => {
@@ -1167,7 +1162,7 @@ describe('agent draft lifecycle', () => {
     expect(state.prompt).toBe(draftState.prompt)
     expect(state.inputImages).toEqual(draftState.inputImages)
     expect(state.maskDraft).toEqual(draftState.maskDraft)
-    expect(state.maskEditorImageId).toBe(imageA.id)
+    expect(state.maskEditorImageId).toBe(storedImageA.id)
     expect(state.agentEditingRoundId).toBeNull()
   })
 
@@ -1178,7 +1173,7 @@ describe('agent draft lifecycle', () => {
     expect(state.prompt).toBe(draftState.prompt)
     expect(state.inputImages).toEqual(draftState.inputImages)
     expect(state.maskDraft).toEqual(draftState.maskDraft)
-    expect(state.maskEditorImageId).toBe(imageA.id)
+    expect(state.maskEditorImageId).toBe(storedImageA.id)
   })
 
   it('persists agent drafts separately from the gallery input draft', () => {
@@ -1187,9 +1182,9 @@ describe('agent draft lifecycle', () => {
     expect(persisted).not.toHaveProperty('prompt')
     expect(persisted.agentInputDrafts['conversation-a']).toMatchObject({
       prompt: draftState.prompt,
-      inputImages: [{ id: imageA.id, dataUrl: '' }],
+      inputImages: [{ id: storedImageA.id, dataUrl: '' }],
       maskDraft: draftState.maskDraft,
-      maskEditorImageId: imageA.id,
+      maskEditorImageId: storedImageA.id,
     })
     expect(persisted.agentInputDrafts['conversation-a']?.updatedAt).toEqual(expect.any(Number))
   })

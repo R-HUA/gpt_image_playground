@@ -80,6 +80,9 @@ const CUSTOM_RECOVERY_POLL_MS = 10_000
 const SUPPORT_PROMPT_IMAGE_THRESHOLD = 50
 const AGENT_INPUT_DRAFT_RETENTION_MS = 3 * 24 * 60 * 60 * 1000
 const AGENT_ROUND_IMAGE_MENTION_RE = /@(?:第)?(\d+)轮图(\d+)/g
+const INPUT_IMAGE_KEEP_ORIGINAL_BYTES = 1 * 1024 * 1024
+const INPUT_IMAGE_TARGET_MAX_BYTES = 2 * 1024 * 1024
+const INPUT_IMAGE_DEFAULT_JPEG_QUALITY = 0.85
 const falRecoveryTimers = new Map<string, ReturnType<typeof setTimeout>>()
 const customRecoveryTimers = new Map<string, ReturnType<typeof setTimeout>>()
 const openAIWatchdogTimers = new Map<string, ReturnType<typeof setTimeout>>()
@@ -811,20 +814,13 @@ function hasUnmaterializedInputImages(images: InputImage[]) {
   return images.some((image) => isTransientInputImage(image) || !image.id.startsWith('in_'))
 }
 
-function serializePersistableInputImage(image: InputImage): InputImage {
-  if (isTransientInputImage(image)) {
-    const storageStatus = image.storageStatus === 'pending' ? 'failed' : image.storageStatus
-    return {
-      id: image.id,
-      dataUrl: image.dataUrl,
-      ...(storageStatus ? { storageStatus } : {}),
-    }
-  }
+function serializePersistableInputImage(image: InputImage): InputImage | null {
+  if (isTransientInputImage(image) || !image.id.startsWith('in_')) return null
   return { id: image.id, dataUrl: '' }
 }
 
 function serializePersistableInputImages(images: InputImage[]) {
-  return images.map(serializePersistableInputImage)
+  return images.map(serializePersistableInputImage).filter((image): image is InputImage => image != null)
 }
 
 function readStoredLocalStateForUser(userId: number): unknown {
@@ -5467,42 +5463,17 @@ export async function importData(file: File, options: ImportOptions = { importCo
   }
 }
 
-/** 添加图片到输入（文件上传）—— 立即显示，后台存储 */
+/** 添加图片到输入（文件上传） */
 export async function addImageFromFile(file: File): Promise<void> {
   if (!file.type.startsWith('image/')) return
-  const dataUrl = await fileToDataUrl(file)
-  // 用临时 ID 立即显示
+  const dataUrl = await fileToCompressedInputDataUrl(file)
   const tempId = `pending_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
-  const storeRequest = storeImage(dataUrl, 'upload').then((id) => {
-    cacheImage(id, dataUrl)
-    return { id, dataUrl }
-  })
-  pendingInputImageStores.set(tempId, storeRequest)
-  useStore.getState().addInputImage({ id: tempId, dataUrl, storageStatus: 'pending' })
-  // 后台存储，完成后替换 ID
-  void storeRequest
-    .then((image) => {
-      const currentIdx = useStore.getState().inputImages.findIndex((img) => img.id === tempId)
-      if (currentIdx >= 0 && useStore.getState().inputImages[currentIdx]?.id === tempId) {
-        useStore.getState().replaceInputImage(currentIdx, image)
-      }
-    })
-    .catch((err) => {
-      const currentIdx = useStore.getState().inputImages.findIndex((img) => img.id === tempId)
-      if (currentIdx >= 0 && useStore.getState().inputImages[currentIdx]?.id === tempId) {
-        markInputImageStoreFailed(tempId, err)
-      } else {
-        forgetPendingInputStore(tempId)
-      }
-    })
-    .finally(() => {
-      if (pendingInputImageStores.get(tempId) === storeRequest) pendingInputImageStores.delete(tempId)
-    })
+  useStore.getState().addInputImage({ id: tempId, dataUrl })
 }
 
 export async function createInputImageFromFile(file: File): Promise<InputImage | null> {
   if (!file.type.startsWith('image/')) return null
-  const dataUrl = await fileToDataUrl(file)
+  const dataUrl = await fileToCompressedInputDataUrl(file)
   const id = await storeImage(dataUrl, 'upload')
   cacheImage(id, dataUrl)
   return { id, dataUrl }
@@ -5524,4 +5495,100 @@ function fileToDataUrl(file: File): Promise<string> {
     reader.onerror = reject
     reader.readAsDataURL(file)
   })
+}
+
+async function fileToCompressedInputDataUrl(file: File): Promise<string> {
+  const dataUrl = await fileToDataUrl(file)
+  if (file.size < INPUT_IMAGE_KEEP_ORIGINAL_BYTES) return dataUrl
+  return compressInputImageDataUrl(dataUrl, {
+    targetMaxBytes: file.size > INPUT_IMAGE_TARGET_MAX_BYTES ? INPUT_IMAGE_TARGET_MAX_BYTES : undefined,
+  })
+}
+
+function dataUrlByteLength(dataUrl: string) {
+  const base64 = dataUrl.split(',', 2)[1] ?? ''
+  const padding = base64.endsWith('==') ? 2 : base64.endsWith('=') ? 1 : 0
+  return Math.max(0, Math.floor(base64.length * 3 / 4) - padding)
+}
+
+function blobToDataUrl(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => resolve(reader.result as string)
+    reader.onerror = reject
+    reader.readAsDataURL(blob)
+  })
+}
+
+function loadImageFromDataUrl(dataUrl: string): Promise<HTMLImageElement> {
+  return new Promise((resolve, reject) => {
+    const image = new Image()
+    image.onload = () => resolve(image)
+    image.onerror = () => reject(new Error('图片加载失败'))
+    image.src = dataUrl
+  })
+}
+
+function canvasToBlob(canvas: HTMLCanvasElement, quality: number): Promise<Blob> {
+  return new Promise((resolve, reject) => {
+    canvas.toBlob((blob) => {
+      if (blob) resolve(blob)
+      else reject(new Error('图片压缩失败'))
+    }, 'image/jpeg', quality)
+  })
+}
+
+async function encodeCanvasAsJpegDataUrl(canvas: HTMLCanvasElement, quality: number) {
+  const blob = await canvasToBlob(canvas, quality)
+  return {
+    dataUrl: await blobToDataUrl(blob),
+    bytes: blob.size,
+  }
+}
+
+async function compressInputImageDataUrl(
+  dataUrl: string,
+  options: { targetMaxBytes?: number } = {},
+): Promise<string> {
+  const image = await loadImageFromDataUrl(dataUrl)
+  if (image.naturalWidth <= 0 || image.naturalHeight <= 0) throw new Error('图片尺寸无效')
+
+  const canvas = document.createElement('canvas')
+  const ctx = canvas.getContext('2d')
+  if (!ctx) throw new Error('当前浏览器不支持 Canvas')
+
+  let width = image.naturalWidth
+  let height = image.naturalHeight
+
+  const draw = () => {
+    canvas.width = Math.max(1, Math.round(width))
+    canvas.height = Math.max(1, Math.round(height))
+    ctx.drawImage(image, 0, 0, canvas.width, canvas.height)
+  }
+
+  draw()
+  let encoded = await encodeCanvasAsJpegDataUrl(canvas, INPUT_IMAGE_DEFAULT_JPEG_QUALITY)
+  const targetMaxBytes = options.targetMaxBytes
+  if (!targetMaxBytes || encoded.bytes <= targetMaxBytes) return encoded.dataUrl
+
+  for (const quality of [0.8, 0.72, 0.64, 0.56, 0.48, 0.4]) {
+    encoded = await encodeCanvasAsJpegDataUrl(canvas, quality)
+    if (encoded.bytes <= targetMaxBytes) return encoded.dataUrl
+  }
+
+  const minDimension = 512
+  for (let i = 0; i < 8 && encoded.bytes > targetMaxBytes && Math.max(width, height) > minDimension; i++) {
+    const scale = Math.max(0.5, Math.sqrt(targetMaxBytes / Math.max(encoded.bytes, 1)) * 0.95)
+    width = Math.max(minDimension, Math.round(width * scale))
+    height = Math.max(minDimension, Math.round(height * scale))
+    draw()
+    encoded = await encodeCanvasAsJpegDataUrl(canvas, INPUT_IMAGE_DEFAULT_JPEG_QUALITY)
+    if (encoded.bytes <= targetMaxBytes) return encoded.dataUrl
+    encoded = await encodeCanvasAsJpegDataUrl(canvas, 0.72)
+    if (encoded.bytes <= targetMaxBytes) return encoded.dataUrl
+  }
+
+  if (encoded.bytes <= targetMaxBytes) return encoded.dataUrl
+  const fallback = await encodeCanvasAsJpegDataUrl(canvas, 0.4)
+  return dataUrlByteLength(fallback.dataUrl) <= targetMaxBytes || fallback.bytes < encoded.bytes ? fallback.dataUrl : encoded.dataUrl
 }
