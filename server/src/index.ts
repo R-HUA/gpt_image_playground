@@ -611,6 +611,48 @@ function putJsonRow(table: string, userId: number, id: string, value: unknown, c
   `).run(userId, id, JSON.stringify(value), createdAt ?? stamp, updatedAt ?? stamp)
 }
 
+const TASK_GENERATION_STATE_FIELDS = [
+  'status',
+  'error',
+  'outputImages',
+  'rawImageUrls',
+  'rawResponsePayload',
+  'actualParams',
+  'actualParamsByImage',
+  'revisedPromptByImage',
+  'queuedAt',
+  'startedAt',
+  'queuePosition',
+  'finishedAt',
+  'elapsed',
+  'falRequestId',
+  'falEndpoint',
+  'falRecoverable',
+  'customTaskId',
+  'customRecoverable',
+  'streamPartialImageIds',
+] as const
+
+function taskHasGenerationJob(userId: number, taskId: string) {
+  return Boolean(db.prepare('SELECT 1 FROM generation_jobs WHERE user_id = ? AND task_id = ? LIMIT 1').get(userId, taskId))
+}
+
+function isBackendGenerationTask(userId: number, taskId: string, task: JsonRecord | null) {
+  return typeof task?.queuedAt === 'number' || taskHasGenerationJob(userId, taskId)
+}
+
+function mergeClientTaskUpdate(userId: number, taskId: string, incoming: JsonRecord) {
+  const previous = getJsonRow<JsonRecord>('tasks', userId, taskId)
+  if (!previous || !isBackendGenerationTask(userId, taskId, previous)) return incoming
+
+  const next: JsonRecord = { ...previous, ...incoming, id: taskId }
+  for (const field of TASK_GENERATION_STATE_FIELDS) {
+    if (field in previous) next[field] = previous[field]
+    else delete next[field]
+  }
+  return next
+}
+
 function deleteJsonRow(table: string, userId: number, id: string) {
   db.prepare(`DELETE FROM ${table} WHERE user_id = ? AND id = ?`).run(userId, id)
 }
@@ -2673,7 +2715,9 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL) {
   }
   if (pathname === '/api/tasks/incomplete') {
     assertMethod(req, 'GET')
-    return sendJson(res, 200, listIncompleteTasks(user.id))
+    const tasks = listIncompleteTasks(user.id)
+    logInfo('tasks_incomplete_listed', { userId: user.id, count: tasks.length })
+    return sendJson(res, 200, tasks)
   }
   if (pathname.startsWith('/api/tasks/')) {
     const id = decodeURIComponent(pathname.slice('/api/tasks/'.length))
@@ -2683,7 +2727,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL) {
     }
     if (req.method === 'PUT') {
       const body = await readJsonBody<JsonRecord>(req)
-      const task: JsonRecord = isRecord(body.task) ? { ...body.task, id } : { id }
+      const task = mergeClientTaskUpdate(user.id, id, isRecord(body.task) ? { ...body.task, id } : { id })
       putJsonRow('tasks', user.id, id, task, asNumber(task.createdAt), asNumber(task.finishedAt) || undefined)
       return sendJson(res, 200, { id })
     }

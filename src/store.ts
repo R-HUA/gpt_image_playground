@@ -2204,6 +2204,10 @@ function isRunningOpenAITask(task: TaskRecord) {
   return task.status === 'running' && isOpenAITask(task)
 }
 
+function isBackendQueuedGenerationTask(task: TaskRecord) {
+  return typeof task.queuedAt === 'number'
+}
+
 function isAsyncCustomProviderTask(settings: AppSettings, provider: string, hasInputImages: boolean) {
   const customProvider = getCustomProviderDefinition(settings, provider)
   if (!customProvider?.poll) return false
@@ -2214,7 +2218,7 @@ function isAsyncCustomProviderTask(settings: AppSettings, provider: string, hasI
 export function markInterruptedOpenAIRunningTasks(tasks: TaskRecord[], now = Date.now()) {
   const interruptedTasks: TaskRecord[] = []
   const updatedTasks = tasks.map((task) => {
-    if (!isRunningOpenAITask(task) || task.customTaskId) return task
+    if (!isRunningOpenAITask(task) || task.customTaskId || isBackendQueuedGenerationTask(task)) return task
 
     const updated: TaskRecord = {
       ...task,
