@@ -252,6 +252,7 @@ export const backendTasks = {
   },
   get: (id: string) => jsonRequest<TaskRecord | null>(`/api/tasks/${encodeURIComponent(id)}`),
   batch: (batchGroupId: string) => jsonRequest<TaskRecord[]>(`/api/tasks/batch/${encodeURIComponent(batchGroupId)}`),
+  byIds: (ids: string[]) => jsonRequest<TaskRecord[]>('/api/tasks/by-ids', jsonInit('POST', { ids })),
   incomplete: () => jsonRequest<TaskRecord[]>('/api/tasks/incomplete'),
   put: (task: TaskRecord) => jsonRequest<{ id: string }>(`/api/tasks/${encodeURIComponent(task.id)}`, jsonInit('PUT', { task })),
   delete: (id: string) => jsonRequest<void>(`/api/tasks/${encodeURIComponent(id)}`, { method: 'DELETE' }),
@@ -272,7 +273,7 @@ export const backendAgentConversations = {
 }
 
 export const backendImages = {
-  get: (id: string) => jsonRequest<StoredImage | undefined>(`/api/images/${encodeURIComponent(id)}`),
+  get: (id: string) => jsonRequest<StoredImage | undefined>(`/api/images/${encodeURIComponent(id)}`, { cache: 'default' }),
   list: () => jsonRequest<StoredImage[]>('/api/images'),
   ids: () => jsonRequest<string[]>('/api/images/ids'),
   put: (image: StoredImage) => jsonRequest<{ id: string }>(`/api/images/${encodeURIComponent(image.id)}`, jsonInit('PUT', { image })),
@@ -283,7 +284,7 @@ export const backendImages = {
 }
 
 export const backendThumbnails = {
-  get: (id: string) => jsonRequest<StoredImageThumbnail | undefined>(`/api/thumbnails/${encodeURIComponent(id)}`),
+  get: (id: string) => jsonRequest<StoredImageThumbnail | undefined>(`/api/thumbnails/${encodeURIComponent(id)}`, { cache: 'default' }),
   put: (thumbnail: StoredImageThumbnail) => jsonRequest<{ id: string }>(`/api/thumbnails/${encodeURIComponent(thumbnail.id)}`, jsonInit('PUT', { thumbnail })),
 }
 

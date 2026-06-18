@@ -89,6 +89,7 @@ export interface AppSettings {
   customProviders: CustomProviderDefinition[]
   providerOrder?: string[]
   clearInputAfterSubmit: boolean
+  clearImagesAfterSubmit: boolean
   persistInputOnRestart: boolean
   reuseTaskApiProfileTemporarily: boolean
   alwaysShowRetryButton: boolean

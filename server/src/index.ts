@@ -580,6 +580,18 @@ function sendNoContent(res: ServerResponse) {
   res.end()
 }
 
+// 内容寻址（ID = sha256(内容)）的不可变资源：允许浏览器长期缓存，避免每次加载重复拉取。
+// 使用 private 因为按用户鉴权，不能进入共享缓存。
+function sendImmutableJson(res: ServerResponse, payload: unknown) {
+  const body = JSON.stringify(payload)
+  res.writeHead(200, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Content-Length': Buffer.byteLength(body),
+    'Cache-Control': 'private, max-age=31536000, immutable',
+  })
+  res.end(body)
+}
+
 function sendError(res: ServerResponse, err: unknown) {
   const statusCode = isRecord(err) && typeof err.statusCode === 'number' ? err.statusCode : 500
   const message = err instanceof Error ? err.message : String(err)
@@ -1335,6 +1347,39 @@ function withQueuePosition(userId: number, task: TaskRecord): TaskRecord {
   return { ...task, queuePosition: getQueuePosition(userId, task.id) }
 }
 
+// 一次性构建排队位置映射，供批量场景使用，避免逐任务重复查询整张队列（原 O(Q²)）
+function buildQueuePositionMap(userId: number) {
+  const rows = db.prepare(`
+    SELECT id, task_id FROM generation_jobs
+    WHERE user_id = ? AND status = 'queued'
+    ORDER BY queued_at ASC, created_at ASC
+  `).all(userId)
+  const positions = new Map<string, number>()
+  rows.forEach((row, index) => {
+    positions.set(String(row.task_id), index + 1)
+    positions.set(String(row.id), index + 1)
+  })
+  return positions
+}
+
+function withQueuePositionFromMap(task: TaskRecord, positions: Map<string, number>): TaskRecord {
+  if (task.status !== 'queued') return task
+  const position = positions.get(task.id)
+  return position ? { ...task, queuePosition: position } : task
+}
+
+function listTasksByIds(userId: number, ids: string[]) {
+  const result: TaskRecord[] = []
+  const seen = new Set<string>()
+  for (const id of ids) {
+    if (!id || seen.has(id)) continue
+    seen.add(id)
+    const task = getJsonRow<TaskRecord>('tasks', userId, id)
+    if (task) result.push(withQueuePosition(userId, task))
+  }
+  return result
+}
+
 function parseTaskCursor(cursor: string | null) {
   if (!cursor) return null
   const decoded = parseJson<JsonRecord>(Buffer.from(cursor, 'base64url').toString('utf8'), {})
@@ -1355,6 +1400,7 @@ function listTasksPage(userId: number, url: URL) {
   const cursor = parseTaskCursor(url.searchParams.get('cursor'))
 
   const rows = db.prepare('SELECT id, json, created_at FROM tasks WHERE user_id = ? ORDER BY created_at DESC, id DESC').all(userId)
+  const queuePositions = buildQueuePositionMap(userId)
   const filtered: TaskRecord[] = []
   let passedCursor = cursor == null
   for (const row of rows) {
@@ -1371,7 +1417,7 @@ function listTasksPage(userId: number, url: URL) {
       const haystack = `${task.prompt || ''}\n${JSON.stringify(task.params ?? {})}`.toLowerCase()
       if (!haystack.includes(q)) continue
     }
-    filtered.push(withQueuePosition(userId, task))
+    filtered.push(withQueuePositionFromMap(task, queuePositions))
     if (filtered.length > limit) break
   }
 
@@ -1381,17 +1427,19 @@ function listTasksPage(userId: number, url: URL) {
 }
 
 function listIncompleteTasks(userId: number) {
+  const queuePositions = buildQueuePositionMap(userId)
   return db.prepare('SELECT json FROM tasks WHERE user_id = ? ORDER BY created_at DESC').all(userId)
     .map((row) => parseJson<TaskRecord>(String(row.json), null as any))
     .filter((task): task is TaskRecord => Boolean(task && (task.status === 'queued' || task.status === 'running')))
-    .map((task) => withQueuePosition(userId, task))
+    .map((task) => withQueuePositionFromMap(task, queuePositions))
 }
 
 function listBatchTasks(userId: number, batchGroupId: string) {
+  const queuePositions = buildQueuePositionMap(userId)
   return db.prepare('SELECT json FROM tasks WHERE user_id = ? ORDER BY created_at DESC').all(userId)
     .map((row) => parseJson<TaskRecord>(String(row.json), null as any))
     .filter((task): task is TaskRecord => Boolean(task && task.batchGroupId === batchGroupId && task.batchKind === 'gallery-image-to-image'))
-    .map((task) => withQueuePosition(userId, task))
+    .map((task) => withQueuePositionFromMap(task, queuePositions))
     .sort((a, b) => {
       const aIndex = typeof a.batchIndex === 'number' ? a.batchIndex : Number.MAX_SAFE_INTEGER
       const bIndex = typeof b.batchIndex === 'number' ? b.batchIndex : Number.MAX_SAFE_INTEGER
@@ -2719,6 +2767,12 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL) {
     logInfo('tasks_incomplete_listed', { userId: user.id, count: tasks.length })
     return sendJson(res, 200, tasks)
   }
+  if (pathname === '/api/tasks/by-ids') {
+    assertMethod(req, 'POST')
+    const body = await readJsonBody<JsonRecord>(req)
+    const ids = Array.isArray(body.ids) ? body.ids.map((id) => asString(id)).filter(Boolean) : []
+    return sendJson(res, 200, listTasksByIds(user.id, ids))
+  }
   if (pathname.startsWith('/api/tasks/')) {
     const id = decodeURIComponent(pathname.slice('/api/tasks/'.length))
     if (req.method === 'GET') {
@@ -2886,7 +2940,10 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL) {
   if (pathname.startsWith('/api/images/')) {
     const id = decodeURIComponent(pathname.slice('/api/images/'.length))
     if (!id || id.includes('/')) throw Object.assign(new Error('Not Found'), { statusCode: 404 })
-    if (req.method === 'GET') return sendJson(res, 200, await getStoredFile('images', user.id, id))
+    if (req.method === 'GET') {
+      const file = await getStoredFile('images', user.id, id)
+      return file ? sendImmutableJson(res, file) : sendJson(res, 200, file)
+    }
     if (req.method === 'PUT') {
       const body = await readJsonBody<JsonRecord>(req)
       if (!isRecord(body.image)) throw Object.assign(new Error('缺少 image'), { statusCode: 400 })
@@ -2910,7 +2967,10 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL) {
   if (pathname.startsWith('/api/thumbnails/')) {
     const id = decodeURIComponent(pathname.slice('/api/thumbnails/'.length))
     if (!id || id.includes('/')) throw Object.assign(new Error('Not Found'), { statusCode: 404 })
-    if (req.method === 'GET') return sendJson(res, 200, await getStoredFile('thumbnails', user.id, id))
+    if (req.method === 'GET') {
+      const file = await getStoredFile('thumbnails', user.id, id)
+      return file ? sendImmutableJson(res, file) : sendJson(res, 200, file)
+    }
     if (req.method === 'PUT') {
       const body = await readJsonBody<JsonRecord>(req)
       if (!isRecord(body.thumbnail)) throw Object.assign(new Error('缺少 thumbnail'), { statusCode: 400 })

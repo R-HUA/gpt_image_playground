@@ -445,6 +445,7 @@ function AtImageOptionThumb({ option }: { option: AtImageOption }) {
 export default function InputBar() {
   const prompt = useStore((s) => s.prompt)
   const appMode = useStore((s) => s.appMode)
+  const isSubmitting = useStore((s) => s.isSubmitting)
   const setPrompt = useStore((s) => s.setPrompt)
   const inputImages = useStore((s) => s.inputImages)
   const addInputImage = useStore((s) => s.addInputImage)
@@ -768,7 +769,7 @@ export default function InputBar() {
   const hasSubmitApiConfig = Boolean(activeProfile.apiKey)
   const batchImageToImageAvailable = appMode === 'gallery' && inputImages.length > 0 && !maskDraft
   const effectiveBatchImageToImage = batchImageToImage && batchImageToImageAvailable
-  const canSubmit = Boolean(prompt.trim() && hasSubmitApiConfig && !activeAgentIsRunning)
+  const canSubmit = Boolean(prompt.trim() && hasSubmitApiConfig && !activeAgentIsRunning && !isSubmitting)
   const submitButtonAriaLabel = activeAgentIsRunning
     ? '停止生成'
     : hasSubmitApiConfig

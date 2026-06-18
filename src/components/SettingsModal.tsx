@@ -1231,6 +1231,24 @@ export default function SettingsModal() {
                   </div>
                 </div>
                 <div className="block">
+                  <div className="mb-1 flex items-center justify-between">
+                    <span className="block text-sm text-gray-600 dark:text-gray-300">提交任务后清除图片输入</span>
+                    <button
+                      type="button"
+                      onClick={() => commitSettings({ ...draft, clearImagesAfterSubmit: !draft.clearImagesAfterSubmit })}
+                      className={`relative inline-flex h-4 w-7 items-center rounded-full transition-colors ${draft.clearImagesAfterSubmit ? 'bg-blue-500' : 'bg-gray-300 dark:bg-gray-600'}`}
+                      role="switch"
+                      aria-checked={draft.clearImagesAfterSubmit}
+                      aria-label="提交任务后清除图片输入"
+                    >
+                      <span className={`inline-block h-3 w-3 transform rounded-full bg-white shadow transition-transform ${draft.clearImagesAfterSubmit ? 'translate-x-[14px]' : 'translate-x-[2px]'}`} />
+                    </button>
+                  </div>
+                  <div data-selectable-text className="text-xs text-gray-500 dark:text-gray-500">
+                    开启后，提交成功创建任务时仅清除参考图，保留提示词。与上方开关相互独立。
+                  </div>
+                </div>
+                <div className="block">
                   <div className="mb-1 flex items-center justify-between gap-3">
                     <span className="block text-sm text-gray-600 dark:text-gray-300">参考图编辑按钮</span>
                     <div className="w-32">

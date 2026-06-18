@@ -10,4 +10,5 @@ dev-proxy.config.json
 .wrangler/
 .qoder/
 .vscode/
+.mindfs/
 result.md

@@ -36,6 +36,11 @@ export function getBatchTasks(batchGroupId: string): Promise<TaskRecord[]> {
   return backendTasks.batch(batchGroupId)
 }
 
+export function getTasksByIds(ids: string[]): Promise<TaskRecord[]> {
+  if (!ids.length) return Promise.resolve([])
+  return backendTasks.byIds(ids)
+}
+
 export function getIncompleteTasks(): Promise<TaskRecord[]> {
   return backendTasks.incomplete()
 }

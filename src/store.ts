@@ -28,6 +28,7 @@ import {
   getTask,
   getBatchTasks,
   getIncompleteTasks,
+  getTasksByIds,
   putTask as dbPutTask,
   deleteTask as dbDeleteTask,
   clearTasks as dbClearTasks,
@@ -87,6 +88,7 @@ const customRecoveryTimers = new Map<string, ReturnType<typeof setTimeout>>()
 const openAIWatchdogTimers = new Map<string, ReturnType<typeof setTimeout>>()
 let taskPollingTimer: ReturnType<typeof setTimeout> | null = null
 let taskPollingInFlight = false
+let searchReloadTimer: ReturnType<typeof setTimeout> | null = null
 const agentRoundControllers = new Map<string, AbortController>()
 let agentConversationPersistenceReady = false
 let agentConversationMigrationPending = false
@@ -1009,6 +1011,7 @@ interface AppState {
   taskNextCursor: string | null
   tasksLoading: boolean
   tasksLoadingMore: boolean
+  isSubmitting: boolean
   favoriteCollections: FavoriteCollection[]
   setFavoriteCollections: (collections: FavoriteCollection[]) => void
   defaultFavoriteCollectionId: string | null
@@ -1698,6 +1701,7 @@ export const useStore = create<AppState>()(
       taskNextCursor: null,
       tasksLoading: false,
       tasksLoadingMore: false,
+      isSubmitting: false,
       favoriteCollections: [createDefaultFavoriteCollection()],
       setFavoriteCollections: (favoriteCollections) => set((state) => {
         const nextCollections = ensureDefaultFavoriteCollection(normalizeFavoriteCollections(favoriteCollections))
@@ -1755,7 +1759,8 @@ export const useStore = create<AppState>()(
         const state = useStore.getState()
         // 收藏夹概览模式下的搜索仅过滤收藏夹名称，不需要重新加载任务列表
         if (!(state.filterFavorite && !state.activeFavoriteCollectionId)) {
-          void reloadTasksFromServer()
+          // 防抖：避免逐字符触发全量任务列表请求（服务端为全表扫描）
+          scheduleSearchReload()
         }
       },
       filterStatus: 'all',
@@ -1912,6 +1917,8 @@ function clearRuntimeStateForUserSwitch() {
   if (taskPollingTimer) clearTimeout(taskPollingTimer)
   taskPollingTimer = null
   taskPollingInFlight = false
+  if (searchReloadTimer) clearTimeout(searchReloadTimer)
+  searchReloadTimer = null
   for (const controller of agentRoundControllers.values()) controller.abort()
   agentRoundControllers.clear()
   if (backendSettingsSaveTimer) clearTimeout(backendSettingsSaveTimer)
@@ -1954,6 +1961,7 @@ function getUserSessionResetState(): Partial<AppState> {
     taskNextCursor: null,
     tasksLoading: false,
     tasksLoadingMore: false,
+    isSubmitting: false,
     streamPreviews: {},
     streamPreviewSlots: {},
     searchQuery: '',
@@ -2095,7 +2103,19 @@ function reconcileTasksForCurrentFilters(current: TaskRecord[], incoming: TaskRe
   return next.sort((a, b) => b.createdAt - a.createdAt)
 }
 
+function scheduleSearchReload() {
+  if (searchReloadTimer) clearTimeout(searchReloadTimer)
+  searchReloadTimer = setTimeout(() => {
+    searchReloadTimer = null
+    void reloadTasksFromServer()
+  }, 300)
+}
+
 export async function reloadTasksFromServer() {
+  if (searchReloadTimer) {
+    clearTimeout(searchReloadTimer)
+    searchReloadTimer = null
+  }
   useStore.setState({ tasksLoading: true })
   try {
     const page = await listTasks(getTaskListQuery())
@@ -2146,11 +2166,15 @@ async function refreshIncompleteTasks() {
     const refreshDoneOrErrored = current.filter((task) =>
       (task.status === 'queued' || task.status === 'running') && !ids.has(task.id),
     )
-    const completed = await Promise.all(refreshDoneOrErrored.map((task) => getTask(task.id).catch(() => null)))
-    const incoming = [...incomplete, ...completed.filter((task): task is TaskRecord => Boolean(task))]
+    const completed = refreshDoneOrErrored.length
+      ? await getTasksByIds(refreshDoneOrErrored.map((task) => task.id)).catch(() => [])
+      : []
+    const incoming = [...incomplete, ...completed]
     if (incoming.length) {
       useStore.setState((state) => ({ tasks: reconcileTasksForCurrentFilters(state.tasks, incoming) }))
     }
+  } catch (error) {
+    console.warn('Failed to refresh incomplete tasks:', error)
   } finally {
     taskPollingInFlight = false
     scheduleTaskPollingIfNeeded()
@@ -2175,12 +2199,41 @@ function scheduleTaskPollingIfNeeded() {
     clearTimeout(taskPollingTimer)
     taskPollingTimer = null
   }
+  // 页面隐藏时暂停轮询，重新可见/联网/聚焦时再恢复，避免后台标签页空耗请求
+  if (typeof document !== 'undefined' && document.hidden) return
   const hasIncomplete = useStore.getState().tasks.some((task) => task.status === 'queued' || task.status === 'running')
   if (!hasIncomplete) return
   taskPollingTimer = setTimeout(() => {
     taskPollingTimer = null
     void refreshIncompleteTasks()
   }, 2000)
+}
+
+// 页面重新可见/联网/聚焦时：立即刷新一次未完成任务并恢复轮询
+function handleTaskPollingWake() {
+  if (typeof document !== 'undefined' && document.hidden) return
+  const hasIncomplete = useStore.getState().tasks.some((task) => task.status === 'queued' || task.status === 'running')
+  if (hasIncomplete) void refreshIncompleteTasks()
+}
+
+let taskPollingListenersBound = false
+function ensureTaskPollingListeners() {
+  if (taskPollingListenersBound || typeof document === 'undefined') return
+  taskPollingListenersBound = true
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) {
+      if (taskPollingTimer) {
+        clearTimeout(taskPollingTimer)
+        taskPollingTimer = null
+      }
+    } else {
+      handleTaskPollingWake()
+    }
+  })
+  if (typeof window !== 'undefined') {
+    window.addEventListener('online', handleTaskPollingWake)
+    window.addEventListener('focus', handleTaskPollingWake)
+  }
 }
 
 async function enqueueGenerationTask(task: TaskRecord, request: GenerationRequest) {
@@ -2551,6 +2604,7 @@ async function recoverFalTask(taskId: string) {
 /** 初始化：从后端加载配置与任务，按需恢复输入图片，并清理孤立图片 */
 export async function initStore(user?: AuthUser) {
   if (user) prepareStoreForUser(user)
+  ensureTaskPollingListeners()
   const backendSettings = await loadBackendSettings()
   if (backendSettings.settings) {
     backendSettingsHydrating = true
@@ -2749,7 +2803,23 @@ export async function initStore(user?: AuthUser) {
 }
 
 /** 提交新任务 */
+let gallerySubmitInFlight = false
+
 export async function submitTask(options: { allowFullMask?: boolean; useCurrentApiProfileWhenReusedMissing?: boolean } = {}) {
+  // 防重复提交：在一次提交（含异步保存参考图、入队）完成前禁止再次进入。
+  // 确认弹窗分支会先返回（触发 finally 解锁），用户确认后再次调用即可正常进入。
+  if (gallerySubmitInFlight) return
+  gallerySubmitInFlight = true
+  useStore.setState({ isSubmitting: true })
+  try {
+    await runSubmitTask(options)
+  } finally {
+    gallerySubmitInFlight = false
+    useStore.setState({ isSubmitting: false })
+  }
+}
+
+async function runSubmitTask(options: { allowFullMask?: boolean; useCurrentApiProfileWhenReusedMissing?: boolean } = {}) {
   const { settings, prompt, inputImages, maskDraft, params, reusedTaskApiProfileId, reusedTaskApiProfileName, reusedTaskApiProfileMissing, showToast, setConfirmDialog } =
     useStore.getState()
   const batchImageToImage = useStore.getState().batchImageToImage && inputImages.length > 0 && !maskDraft
@@ -2877,7 +2947,7 @@ export async function submitTask(options: { allowFullMask?: boolean; useCurrentA
       index,
       size: orderedInputImages.length,
     }))
-    await Promise.all(batchTasks.map((task) => enqueueGenerationTask(task, {
+    const results = await Promise.allSettled(batchTasks.map((task) => enqueueGenerationTask(task, {
         profile: activeProfile,
         settings: requestSettings,
         prompt: replaceImageMentionsForApi(task.prompt, 1),
@@ -2885,22 +2955,42 @@ export async function submitTask(options: { allowFullMask?: boolean; useCurrentA
         inputImageIds: task.inputImageIds,
         maskImageId: null,
       })))
+    const failed = results.filter((result) => result.status === 'rejected').length
+    if (failed > 0) {
+      const reason = results.find((result): result is PromiseRejectedResult => result.status === 'rejected')?.reason
+      const reasonText = reason instanceof Error ? reason.message : String(reason ?? '未知错误')
+      const succeeded = batchTasks.length - failed
+      useStore.getState().showToast(
+        succeeded > 0
+          ? `部分提交失败：${succeeded} 个已入队，${failed} 个失败，输入已保留请重试`
+          : `批量提交失败：${reasonText}，输入已保留请重试`,
+        'error',
+      )
+      return
+    }
     useStore.getState().showToast(`已提交批量图生图：${batchTasks.length} 个任务已进入队列`, 'success')
   } else {
     const task = createBaseTask(orderedInputImages.map((i) => i.id), normalizedParams)
-    await enqueueGenerationTask(task, {
-      profile: activeProfile,
-      settings: requestSettings,
-      prompt: replaceImageMentionsForApi(task.prompt, orderedInputImages.length),
-      params: task.params,
-      inputImageIds: task.inputImageIds,
-      maskImageId: task.maskImageId,
-    })
+    try {
+      await enqueueGenerationTask(task, {
+        profile: activeProfile,
+        settings: requestSettings,
+        prompt: replaceImageMentionsForApi(task.prompt, orderedInputImages.length),
+        params: task.params,
+        inputImageIds: task.inputImageIds,
+        maskImageId: task.maskImageId,
+      })
+    } catch (err) {
+      useStore.getState().showToast(`提交失败：${err instanceof Error ? err.message : String(err)}，输入已保留请重试`, 'error')
+      return
+    }
     useStore.getState().showToast('任务已提交队列', 'success')
   }
 
   if (settings.clearInputAfterSubmit) {
     useStore.getState().setPrompt('')
+    useStore.getState().clearInputImages()
+  } else if (settings.clearImagesAfterSubmit) {
     useStore.getState().clearInputImages()
   }
   useStore.getState().setReusedTaskApiProfile(null)
